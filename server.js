@@ -35,6 +35,27 @@ const wss = new WebSocketServer({ server, maxPayload: 4096 });
 const SEED = (Math.random() * 2147483647) | 0;
 const START_TIME = Date.now();
 const edits = new Map();     // "x,y,z" -> type (0 = đã phá)
+/* ⛏️ KHOÁNG SẢN trong lòng đất (giống hệt client!) */
+const ORE_IT = { 12: 10, 13: 11, 14: 12, 15: 13 }; // khối quặng -> mã vật phẩm (than, sắt, vàng, hồng ngọc)
+function hsh3(x, y, z) {
+  let n = (Math.imul(x, 374761393) + Math.imul(y, 915488749) + Math.imul(z, 668265263) + Math.imul(SEED, 974634733)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177); n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;
+}
+function oreAt(x, y, z, h) {
+  if (h === undefined) h = heightAt(x, z);
+  if (y < 2 || y >= h - 2) return 0;
+  const r = hsh3(x, y, z);
+  if (r < 0.030) return 12;                 // than
+  if (r < 0.048) return 13;                 // sắt
+  if (y < h - 6 && r < 0.058) return 14;    // vàng (sâu hơn)
+  if (y < h - 9 && r < 0.0625) return 15;   // hồng ngọc (rất sâu, hiếm)
+  return 0;
+}
+/* 🎮 VÁN CHƠI: 15 phút hoặc ai gom đủ 5 ĐÁ SỨC MẠNH 🔮 */
+const MATCH_LEN = 15 * 60 * 1000;
+const STONE_IT = 14, STONE_TOTAL = 5;
+let matchStart = Date.now(), matchOver = false;
 const players = new Map();   // id -> {id, ws, name, x, y, z, yaw, hp}
 /* 🏆 BẢNG VÀNG — thống kê theo TÊN (giữ nguyên khi vào lại) */
 const stats = new Map();     // nameKey -> {name, esc, ans, caught}
@@ -261,6 +282,41 @@ function spawnDrop(it, x, y, z) {
   itemDrops.set(id, { it, x, y, z, t0: Date.now() });
   broadcast({ type: 'drop', id, it, x: Math.round(x * 100) / 100, y, z: Math.round(z * 100) / 100 });
 }
+function stonesLeft() { let n = 0; for (const d of itemDrops.values()) if (d.it === STONE_IT) n++; return n; }
+function spawnStones() {
+  for (let i = 0; i < STONE_TOTAL; i++) {
+    for (let t = 0; t < 60; t++) {
+      const x = ((Math.random() * 2 - 1) * (WORLD_R - 8)) | 0, z = ((Math.random() * 2 - 1) * (WORLD_R - 8)) | 0;
+      const h = topAt(x, z);
+      if (h <= SEA) continue;
+      spawnDrop(STONE_IT, x + .5, h + 1, z + .5);
+      break;
+    }
+  }
+  console.log('🔮 Đã giấu ' + stonesLeft() + ' Đá Sức Mạnh trong bản đồ');
+}
+function matchMsg(p) {
+  return { type: 'match', start: matchStart, len: MATCH_LEN, left: stonesLeft(), mine: (p && p.stones) || 0 };
+}
+function endMatch(winnerP, reason) {
+  if (matchOver) return;
+  matchOver = true;
+  const counts = [...players.values()].map(p => [p.name, p.stones || 0]).sort((a, b) => b[1] - a[1]);
+  let winner = winnerP ? winnerP.name : null;
+  if (!winner && counts.length && counts[0][1] > 0 && (counts.length < 2 || counts[0][1] > counts[1][1])) winner = counts[0][0];
+  broadcast({ type: 'gameover', winner, reason, counts: counts.slice(0, 8) });
+  console.log('🏁 Hết ván (' + reason + ') — thắng: ' + (winner || 'hòa'));
+  setTimeout(resetMatch, 12000);
+}
+function resetMatch() {
+  edits.clear();
+  itemDrops.clear();
+  for (const p of players.values()) p.stones = 0;
+  matchStart = Date.now(); matchOver = false;
+  spawnStones();
+  broadcast({ type: 'reset' });
+  console.log('🔄 Ván mới bắt đầu!');
+}
 function mobDeath(m) {
   mobs.delete(m.id);
   broadcast({ type: 'mobdie', id: m.id });
@@ -351,16 +407,23 @@ function mobTick(s) {
       spawnCreeperNear(list[(Math.random() * list.length) | 0]);
     }
   }
-  // vật phẩm: nhặt & hết hạn
+  // vật phẩm: nhặt & hết hạn (Đá Sức Mạnh không bao giờ hết hạn)
   const now = Date.now();
+  if (!matchOver && now - matchStart > MATCH_LEN) endMatch(null, 'time');
   for (const [id, d] of [...itemDrops]) {
-    if (now - d.t0 > 60000) { itemDrops.delete(id); broadcast({ type: 'took', id, by: 0 }); continue; }
+    if (d.it !== STONE_IT && now - d.t0 > 60000) { itemDrops.delete(id); broadcast({ type: 'took', id, by: 0 }); continue; }
+    if (matchOver) continue;
     for (const p of players.values()) {
       if (p.hp <= 0) continue;
       const dd = Math.sqrt((p.x - d.x) ** 2 + (p.z - d.z) ** 2);
       if (dd < 1.5 && Math.abs(p.y - d.y) < 2.2) {
         itemDrops.delete(id);
         broadcast({ type: 'took', id, by: p.id });
+        if (d.it === STONE_IT) {
+          p.stones = (p.stones || 0) + 1;
+          broadcast({ type: 'stone', id: p.id, name: p.name, n: p.stones, left: stonesLeft() });
+          if (p.stones >= STONE_TOTAL) endMatch(p, 'stones');
+        }
         break;
       }
     }
@@ -484,6 +547,7 @@ wss.on('connection', (ws) => {
         drops: [...itemDrops.entries()].map(([di, d]) => [di, d.it, d.x, d.y, d.z]),
       }));
       ws.send(JSON.stringify(boardMsg())); // gửi Bảng Vàng hiện tại cho người mới
+      ws.send(JSON.stringify(matchMsg(p))); // và trạng thái ván chơi
       broadcast({ type: 'join', p: { id, name: p.name, x: p.x, y: p.y, z: p.z, yaw: p.yaw, app: p.app } }, id);
       console.log(`[+] ${p.name} (#${id}) vào — ${players.size}/${MAX_PLAYERS}`);
       return;
@@ -505,13 +569,22 @@ wss.on('connection', (ws) => {
       return;
     }
     if (m.type === 'block') {
+      if (matchOver) return; // hết ván — chờ ván mới
       if (p.blockCount++ > 40) return; // chống spam (reset mỗi giây)
       if (!Number.isInteger(m.x) || !Number.isInteger(m.y) || !Number.isInteger(m.z)) return;
       if (m.x < -WORLD_R || m.x >= WORLD_R || m.z < -WORLD_R || m.z >= WORLD_R) return;
       if (m.y < 1 || m.y >= WORLD_H) return; // y=0 là đá gốc, không sửa được
       const t = m.t | 0;
-      if (t < 0 || t > 10) return;           // không cho đặt đá gốc (11)
-      edits.set(m.x + ',' + m.y + ',' + m.z, t);
+      if (t < 0 || t > 10) return;           // không cho đặt đá gốc (11) hay quặng (12-15)
+      const k = m.x + ',' + m.y + ',' + m.z;
+      if (t === 0) { // đào: nếu khối gốc là QUẶNG thì rơi nguyên liệu
+        const prev = edits.get(k);
+        if (prev === undefined && !structure.has(k) && m.y <= heightAt(m.x, m.z)) {
+          const ore = oreAt(m.x, m.y, m.z);
+          if (ore) spawnDrop(ORE_IT[ore], m.x + .5, m.y, m.z + .5);
+        }
+      }
+      edits.set(k, t);
       broadcast({ type: 'block', x: m.x, y: m.y, z: m.z, t }, id);
       return;
     }
@@ -521,11 +594,11 @@ wss.on('connection', (ws) => {
       p.lastAtk = now;
       const mob = mobs.get(m.id | 0);
       if (!mob) { if (process.env.DEBUG) console.log('atk: no mob', m.id); return; }
-      const w = m.w | 0; // 0 tay/cuốc, 1 kiếm, 2 tên, 3 thước kẻ, 4 compa, 5 kiếm lửa, 6 kiếm băng, 7 cung sấm
-      const DMG = { 0: 2, 1: 8, 2: 6, 3: 14, 4: 10, 5: 16, 6: 14, 7: 14 };
+      const w = m.w | 0; // 0 tay/cuốc, 1 kiếm, 2 tên, 3 thước kẻ, 4 compa, 5 kiếm lửa, 6 kiếm băng, 7 cung sấm, 8 kiếm sắt, 9 kiếm vàng, 10 cung hồng ngọc
+      const DMG = { 0: 2, 1: 8, 2: 6, 3: 14, 4: 10, 5: 16, 6: 14, 7: 14, 8: 18, 9: 22, 10: 18 };
       if (DMG[w] === undefined) return;
       const d = Math.hypot(mob.x - p.x, mob.z - p.z);
-      if (d > ((w === 2 || w === 4 || w === 7) ? 32 : 6.5)) { if (process.env.DEBUG) console.log('atk: too far', d.toFixed(1)); return; }
+      if (d > ((w === 2 || w === 4 || w === 7 || w === 10) ? 32 : 6.5)) { if (process.env.DEBUG) console.log('atk: too far', d.toFixed(1)); return; }
       mob.hp -= DMG[w];
       if (w === 6) mob.ai.slowT = 2.5; // Kiếm Băng làm chậm
       broadcast({ type: 'mobhurt', id: mob.id });
@@ -580,9 +653,18 @@ wss.on('connection', (ws) => {
     if (m.type === 'skin') { // ngoại hình chibi + pet
       if (m.app && typeof m.app === 'object') {
         const a = {};
-        for (const k of ['sk','hr','hc','sh','pa','ht','pet','st']) a[k] = Math.max(0, Math.min(9, m.app[k] | 0));
+        for (const k of ['sk','hr','hc','sh','pa','ht','pet','st']) a[k] = Math.max(0, Math.min(12, m.app[k] | 0));
         p.app = a;
         broadcast({ type: 'skin', id, app: a }, id);
+      }
+      return;
+    }
+    if (m.type === 'starve') { // 🍗 đói lả — mất máu từ từ
+      const now2 = Date.now();
+      if (p.hp > 0 && (!p.starveCd || now2 - p.starveCd > 2400)) {
+        p.starveCd = now2;
+        p.hp = Math.max(0, p.hp - 1);
+        try { ws.send(JSON.stringify({ type: 'hurt', hp: p.hp })); } catch (e) {}
       }
       return;
     }
@@ -636,6 +718,7 @@ setInterval(() => {
   }
 }, 3000);
 
+spawnStones();
 server.listen(PORT, () => {
   console.log('==========================================');
   console.log('  KhốiCraft Online — máy chủ đã sẵn sàng!');
