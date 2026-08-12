@@ -10,11 +10,11 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = parseInt(process.env.MAX_PLAYERS || '35', 10);
-const WORLD_R = 80, WORLD_H = 64;
+const WORLD_R = 80, WORLD_H = 128;   // nâng từ 64 vì mặt đất đã dời lên (GROUND_LIFT)
 // Khu vực đặc biệt (GIỐNG HỆT client!)
-const CAMPUS = {x0:-24, x1:24, z0:8, z1:46, H:12};
+const CAMPUS = {x0:-24, x1:24, z0:8, z1:46, H:60};   // 12 + GROUND_LIFT
 const LAKE = {x:-45, z:-35, r:13, depth:5};
-const TRACK = {x0:33, x1:75, z0:-1, z1:31, H:12, cx:54, cz:15, rx:18, rz:13};
+const TRACK = {x0:33, x1:75, z0:-1, z1:31, H:60, cx:54, cz:15, rx:18, rz:13};   // 12 + GROUND_LIFT
 
 const INDEX = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
 const THREE_JS = fs.readFileSync(path.join(__dirname, 'public', 'three.min.js'));
@@ -67,8 +67,8 @@ function oreAt(x, y, z, h) {
   const r = hsh3(x, y, z);
   if (r < 0.030) return 12;                 // than
   if (r < 0.048) return 13;                 // sắt
-  if (y < h - 6 && r < 0.058) return 14;    // vàng (sâu hơn)
-  if (y < h - 9 && r < 0.0625) return 15;   // hồng ngọc (rất sâu, hiếm)
+  if (y < h * 0.55 && r < 0.058) return 14;    // vàng — ⚠️ GIỐNG HỆT client: đổi sang
+  if (y < h * 0.35 && r < 0.0625) return 15;   //   TỈ LỆ vì đất nay dày gấp 5
   return 0;
 }
 /* 🎮 VÁN CHƠI: 15 phút hoặc ai gom đủ 5 ĐÁ SỨC MẠNH 🔮 */
@@ -92,7 +92,11 @@ function boardMsg() {
 let nextId = 1;
 
 /* ---------- địa hình (giống hệt client, cùng seed) ---------- */
-const SEA = 10, DAY_LEN = 480;
+// 🪨 Nâng CẢ địa hình lên 48 khối -> từ mặt đất xuống đá gốc dày ~60 thay vì ~12
+//    (gấp ~5). Hình dạng bề mặt KHÔNG đổi vì mọi mốc độ cao dời cùng nhau.
+//    ⚠️ PHẢI GIỐNG HỆT client!
+const GROUND_LIFT = 48;
+const SEA = 58, DAY_LEN = 480;       // 10 + GROUND_LIFT
 function hsh(x, z) {
   let n = (Math.imul(x, 374761393) + Math.imul(z, 668265263) + Math.imul(SEED, 974634733)) | 0;
   n = Math.imul(n ^ (n >>> 13), 1274126177); n ^= n >>> 16;
@@ -111,7 +115,7 @@ function heightAt(x, z) {
   if (h === undefined) {
     let a = 0, amp = 1, f = 0.028, tot = 0;
     for (let o = 0; o < 4; o++) { a += vnoise(x * f + 100, z * f + 100) * amp; tot += amp; amp *= 0.5; f *= 2.1; }
-    h = Math.floor(3 + (a / tot) * 18);
+    h = Math.floor(3 + GROUND_LIFT + (a / tot) * 18);   // ⚠️ GIỐNG HỆT client!
     // hồ nước: lòng chảo
     const ldx = x - LAKE.x, ldz = z - LAKE.z, dl = Math.sqrt(ldx * ldx + ldz * ldz);
     if (dl < LAKE.r) { const t = 1 - dl / LAKE.r; h = SEA - 1 - Math.floor(LAKE.depth * t); }
@@ -267,6 +271,31 @@ const structure = new Map(); // "x,y,z" -> type
     for (let off = -2.4; off <= 2.4; off += 0.5) add(Math.round(sx+nx*off), H+5, Math.round(sz+nz*off), 9);
   }
 })();
+/* ═══════════ 🕳️ HANG ĐỘNG — ⚠️ PHẢI GIỐNG HỆT client! ═══════════
+   `vn3` là nhiễu mượt 3 chiều dựng từ `hsh3` (dùng chung SEED) nên hang ở hai bên
+   nằm ĐÚNG cùng chỗ. Lệch một chữ là người chơi thấy hang mà server vẫn coi là đá
+   đặc -> đi vào bị đẩy ra, hoặc ngược lại rơi xuyên đất.
+   Hang = GIAO của hai vùng nhiễu khác tần số: một vùng thôi thì ra bọng tròn rời
+   rạc, giao hai vùng cho ra đường hầm uốn lượn nối nhau. */
+function vn3(u, v, w) {
+  const iu = Math.floor(u), iv = Math.floor(v), iw = Math.floor(w);
+  const fu = smooth(u - iu), fv = smooth(v - iv), fw = smooth(w - iw);
+  const c000 = hsh3(iu, iv, iw),         c100 = hsh3(iu + 1, iv, iw);
+  const c010 = hsh3(iu, iv + 1, iw),     c110 = hsh3(iu + 1, iv + 1, iw);
+  const c001 = hsh3(iu, iv, iw + 1),     c101 = hsh3(iu + 1, iv, iw + 1);
+  const c011 = hsh3(iu, iv + 1, iw + 1), c111 = hsh3(iu + 1, iv + 1, iw + 1);
+  const x00 = c000 + (c100 - c000) * fu, x10 = c010 + (c110 - c010) * fu;
+  const x01 = c001 + (c101 - c001) * fu, x11 = c011 + (c111 - c011) * fu;
+  const y0 = x00 + (x10 - x00) * fv,     y1 = x01 + (x11 - x01) * fv;
+  return y0 + (y1 - y0) * fw;
+}
+function caveAt(x, y, z, h) {
+  if (y < 4) return false;        // chừa 4 lớp đáy: hang không thông xuống đá gốc
+  if (y > h - 7) return false;    // không đục thủng mặt đất
+  const a = vn3(x * 0.045, y * 0.075, z * 0.045);
+  const b = vn3(x * 0.028 + 70.5, y * 0.05 + 70.5, z * 0.028 + 70.5);
+  return a > 0.615 && b > 0.555;
+}
 function solidAt(x, y, z) {
   if (y <= 0) return true;
   const k = x + ',' + y + ',' + z;
@@ -274,10 +303,16 @@ function solidAt(x, y, z) {
   if (e !== undefined) return e > 0 && e !== 7;
   const s = structure.get(k);
   if (s !== undefined) return true;
-  return y <= heightAt(x, z);
+  const h = heightAt(x, z);
+  if (y > h) return false;
+  return !caveAt(x, y, z, h);          // ⚠️ khoét hang — client khoét y hệt
 }
 function topAt(x, z) {
-  for (let y = WORLD_H - 1; y >= 0; y--) if (solidAt(x, y, z)) return y;
+  /* Trước quét từ WORLD_H-1. WORLD_H tăng gấp đôi VÀ solidAt nay còn gọi caveAt
+     (16 lần băm) nên quét cả cột rất tốn. Bắt đầu từ mặt đất + 24 là đủ trùm mái
+     trường và cầu vượt đường đua, tiết kiệm ~100 vòng mỗi lần gọi. */
+  const start = Math.min(WORLD_H - 1, heightAt(x, z) + 24);
+  for (let y = start; y >= 0; y--) if (solidAt(x, y, z)) return y;
   return 0;
 }
 const sunH = () => Math.sin(((Date.now() / 1000 % DAY_LEN) / DAY_LEN) * Math.PI * 2);
@@ -545,7 +580,7 @@ wss.on('connection', (ws) => {
     return;
   }
   const id = nextId++;
-  const p = { id, ws, name: 'Người chơi ' + id, x: 0.5, y: 40, z: 0.5, yaw: 0, hp: 20, lastAtk: 0, spawnAt: Date.now() };
+  const p = { id, ws, name: 'Người chơi ' + id, x: 0.5, y: 96, z: 0.5, yaw: 0, hp: 20, lastAtk: 0, spawnAt: Date.now() };
   players.set(id, p);
   let saidHello = false;
   p.blockCount = 0; p.chatCount = 0;
