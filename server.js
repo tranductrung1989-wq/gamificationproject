@@ -10,7 +10,13 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = parseInt(process.env.MAX_PLAYERS || '35', 10);
-const WORLD_R = 80, WORLD_H = 128;   // nâng từ 64 vì mặt đất đã dời lên (GROUND_LIFT)
+/* ⚠️ `let` chứ không phải `const`: đổi theo bản đồ đang xử lý (xem useWorld). */
+let WORLD_R = 80, WORLD_H = 128, IS_V = false;
+const VGY = 63;                 // cao độ nền bản đồ Làng — ⚠️ GIỐNG HỆT client
+const MAPSPEC = {
+  campus:  { R: 80,  H: 128, spawnY: 96 },
+  village: { R: 100, H: 212, spawnY: 78 },
+};
 // Khu vực đặc biệt (GIỐNG HỆT client!)
 const CAMPUS = {x0:-24, x1:24, z0:8, z1:46, H:60};   // 12 + GROUND_LIFT
 const LAKE = {x:-45, z:-35, r:13, depth:5};
@@ -22,6 +28,7 @@ const THREE_JS = fs.readFileSync(path.join(__dirname, 'public', 'three.min.js'))
 // 🖼️ Texture HD: public/tex/256/*.webp, public/tex/512/*.webp — chỉ tải khi người chơi chọn Vừa/Cao.
 // Đọc theo yêu cầu (không giữ RAM) + cho trình duyệt cache 30 ngày.
 const TEX_DIR = path.join(__dirname, 'public', 'tex');
+const MAPS_DIR = path.join(__dirname, 'public', 'maps');
 const TEX_MIME = { '.webp': 'image/webp', '.png': 'image/png', '.json': 'application/json; charset=utf-8' };
 
 const server = http.createServer((req, res) => {
@@ -29,6 +36,20 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith('/three.min.js')) {
     res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=86400' });
     res.end(THREE_JS);
+    return;
+  }
+  /* Dữ liệu bản đồ (maps/village.json ~936 KB). Cache 1 ngày: file này chỉ đổi
+     khi mình dựng lại bản đồ, nhưng không đặt 'immutable' để còn sửa được. */
+  if (req.url.startsWith('/maps/')) {
+    const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/maps\//, '');
+    const file = path.join(MAPS_DIR, rel);
+    if (!file.startsWith(MAPS_DIR + path.sep) || !/\.json$/.test(file)) { res.writeHead(403); res.end(); return; }
+    fs.readFile(file, (err, data) => {
+      if (err) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8',
+                           'Cache-Control': 'public, max-age=86400' });
+      res.end(data);
+    });
     return;
   }
   if (req.url.startsWith('/tex/')) {
@@ -52,8 +73,45 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, maxPayload: 4096 });
 
 const SEED = (Math.random() * 2147483647) | 0;
+
+/* ═══════════ 🗺️ NHIỀU THẾ GIỚI ═══════════
+   Mỗi bản đồ một hộp trạng thái riêng. `W` là thế giới ĐANG xử lý — mọi hàm bên
+   dưới đọc/ghi qua `W.` nên không phải truyền tham số. Đổi bằng useWorld(). */
+function newWorld(id) {
+  const sp = MAPSPEC[id];
+  return { id, R: sp.R, H: sp.H, spawnY: sp.spawnY,
+    edits: new Map(),         // "x,y,z" -> mã khối (0 = đã phá)
+    structure: new Map(),     // công trình server dựng (trường học / build của làng)
+    mobs: new Map(),
+    itemDrops: new Map(),
+    hCache: new Map(),
+    pads: [],                 // vùng san phẳng (bản đồ Làng), nạp từ maps/village.json
+    mobNextId: 1, dropNextId: 1,
+    matchStart: Date.now(), matchOver: false,
+    animalT: 8, zombieT: 3, creeperT: 15, fishT: 6 };
+}
+const WORLDS = { campus: newWorld('campus'), village: newWorld('village') };
+let W = WORLDS.campus;
+function useWorld(id) {
+  W = WORLDS[id] || WORLDS.campus;
+  WORLD_R = W.R; WORLD_H = W.H; IS_V = (W.id === 'village');
+}
+/* Người chơi TRONG thế giới đang xử lý. Trả về MẢNG chứ không phải generator, vì
+   nhiều chỗ vừa lặp vừa xoá phần tử. */
+function wplayers() {
+  const out = [];
+  for (const p of players.values()) if (p.map === W.id) out.push(p);
+  return out;
+}
+function wcount() { let n = 0; for (const p of players.values()) if (p.map === W.id) n++; return n; }
+function mapCounts() {
+  const c = {};
+  for (const id in WORLDS) c[id] = 0;
+  for (const p of players.values()) if (c[p.map] !== undefined) c[p.map]++;
+  return c;
+}
 const START_TIME = Date.now();
-const edits = new Map();     // "x,y,z" -> type (0 = đã phá)
+/* `edits` giờ thuộc từng thế giới — xem newWorld() */
 /* ⛏️ KHOÁNG SẢN trong lòng đất (giống hệt client!) */
 const ORE_IT = { 12: 10, 13: 11, 14: 12, 15: 13 }; // khối quặng -> mã vật phẩm (than, sắt, vàng, hồng ngọc)
 function hsh3(x, y, z) {
@@ -74,7 +132,7 @@ function oreAt(x, y, z, h) {
 /* 🎮 VÁN CHƠI: 15 phút hoặc ai gom đủ 5 ĐÁ SỨC MẠNH 🔮 */
 const MATCH_LEN = 15 * 60 * 1000;
 const STONE_IT = 14, STONE_TOTAL = 5;
-let matchStart = Date.now(), matchOver = false;
+/* matchStart / matchOver: MỖI BẢN ĐỒ MỘT VÁN riêng — xem newWorld() */
 const players = new Map();   // id -> {id, ws, name, x, y, z, yaw, hp}
 /* 🏆 BẢNG VÀNG — thống kê theo TÊN (giữ nguyên khi vào lại) */
 const stats = new Map();     // nameKey -> {name, esc, ans, caught}
@@ -108,10 +166,57 @@ function vnoise(u, v) {
   const a = hsh(iu, iv), b = hsh(iu + 1, iv), c = hsh(iu, iv + 1), d = hsh(iu + 1, iv + 1);
   return a + (b - a) * fu + (c - a) * fv + (a - b - c + d) * fu * fv;
 }
-const hCache = new Map();
+/* ═══════════ 🏘️ ĐỊA HÌNH BẢN ĐỒ LÀNG ═══════════
+   ⚠️ PHẢI GIỐNG HỆT client (patch_maps.py -> heightAtVillage). Lệch một chữ là
+   người chơi rơi xuyên mặt đất. tools/tsync.js so 200.000 ô để kiểm tra. */
+function padDist(x, z) {
+  const V = W.pads;
+  let best = 1e9;
+  for (let i = 0; i < V.length; i++) {
+    const p = V[i];
+    const dx = Math.max(0, Math.max(p[0] - x, x - p[1]));
+    const dz = Math.max(0, Math.max(p[2] - z, z - p[3]));
+    const d = dx > dz ? dx : dz;
+    if (d < best) { best = d; if (d === 0) return 0; }
+  }
+  return best;
+}
+const VLAKE = { x: 78, z: 0, r: 16, depth: 6 };
+const VTRACK = { x0: 22, x1: 62, z0: 46, z1: 86, H: 63, cx: 42, cz: 66, rx: 17, rz: 16 };
+function heightAtVillage(x, z) {
+  let a = 0, amp = 1, f = 0.021, tot = 0;
+  for (let o = 0; o < 4; o++) { a += vnoise(x * f + 300, z * f + 300) * amp; tot += amp; amp *= 0.5; f *= 2.1; }
+  let h = Math.floor(VGY - 5 + (a / tot) * 12);
+  const L = VLAKE;
+  const ldx = x - L.x, ldz = z - L.z, dl = Math.sqrt(ldx * ldx + ldz * ldz);
+  if (dl < L.r) { const t = 1 - dl / L.r; h = SEA - 1 - Math.floor(L.depth * t); }
+  else if (dl < L.r + 7) { const t = (dl - L.r) / 7; h = Math.round((SEA + 1) * (1 - t) + h * t); }
+  const K2 = VTRACK;
+  if (x >= K2.x0 - 4 && x <= K2.x1 + 4 && z >= K2.z0 - 4 && z <= K2.z1 + 4) {
+    const dx = Math.max(0, Math.max(K2.x0 - x, x - K2.x1));
+    const dz = Math.max(0, Math.max(K2.z0 - z, z - K2.z1));
+    const d = Math.max(dx, dz);
+    if (d === 0) h = K2.H; else { const t = d / 4; h = Math.round(K2.H * (1 - t) + h * t); }
+  }
+  const d = padDist(x, z);
+  if (d === 0) h = VGY;
+  else if (d <= 5) { const t = d / 5; h = Math.round(VGY * (1 - t) + h * t); }
+  return h;
+}
 function heightAt(x, z) {
+  if (IS_V) {
+    const k = x * 100003 + z;
+    const c = W.hCache.get(k);
+    if (c !== undefined) return c;
+    const h = heightAtVillage(x, z);
+    W.hCache.set(k, h);
+    return h;
+  }
+  return heightAtCampus(x, z);
+}
+function heightAtCampus(x, z) {
   const k = x + ',' + z;
-  let h = hCache.get(k);
+  let h = W.hCache.get(k);
   if (h === undefined) {
     let a = 0, amp = 1, f = 0.028, tot = 0;
     for (let o = 0; o < 4; o++) { a += vnoise(x * f + 100, z * f + 100) * amp; tot += amp; amp *= 0.5; f *= 2.1; }
@@ -134,16 +239,19 @@ function heightAt(x, z) {
       const d = Math.max(dx, dz);
       if (d === 0) h = TRACK.H; else { const t = d / 4; h = Math.round(TRACK.H * (1 - t) + h * t); }
     }
-    hCache.set(k, h);
+    W.hCache.set(k, h);
   }
   return h;
 }
 /* ---------- kết cấu trường học (phần đặc, để mob đi lại đúng) ---------- */
-const structure = new Map(); // "x,y,z" -> type
+/* `structure` giờ thuộc từng thế giới — xem newWorld() */
+/* ⚠️ Dựng vào thế giới SÂN TRƯỜNG. Lúc này `W` vẫn đang trỏ vào campus (giá trị
+   khởi tạo) nên đúng, nhưng gọi useWorld cho rõ ràng và chống lỗi về sau. */
+useWorld('campus');
 (function buildSchoolStructure() {
   const F = CAMPUS.H;
-  const add = (x, y, z, t) => structure.set(x + ',' + y + ',' + z, t);
-  const del = (x, y, z) => structure.delete(x + ',' + y + ',' + z);
+  const add = (x, y, z, t) => W.structure.set(x + ',' + y + ',' + z, t);
+  const del = (x, y, z) => W.structure.delete(x + ',' + y + ',' + z);
   const box = (x0, y0, z0, x1, y1, z1, t) => { for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) add(x, y, z, t); };
   const bld = (x0, x1, z0, z1, nf) => {
     for (let f = 0; f < nf; f++) {
@@ -258,7 +366,7 @@ const structure = new Map(); // "x,y,z" -> type
       }
       if (i % 4 === 0 && yo >= 1) {
         const cx2 = Math.round(x), cz2 = Math.round(z);
-        for (let y = H+1; y < dy; y++) { const kk = cx2+','+y+','+cz2; if (!structure.has(kk)) structure.set(kk, 4); }
+        for (let y = H+1; y < dy; y++) { const kk = cx2+','+y+','+cz2; if (!W.structure.has(kk)) W.structure.set(kk, 4); }
       }
     }
     const [sx,sz] = pts[0], [sx2,sz2] = pts[1];
@@ -299,9 +407,9 @@ function caveAt(x, y, z, h) {
 function solidAt(x, y, z) {
   if (y <= 0) return true;
   const k = x + ',' + y + ',' + z;
-  const e = edits.get(k);
+  const e = W.edits.get(k);
   if (e !== undefined) return e > 0 && e !== 7;
-  const s = structure.get(k);
+  const s = W.structure.get(k);
   if (s !== undefined) return true;
   const h = heightAt(x, z);
   if (y > h) return false;
@@ -322,21 +430,19 @@ const MOB_HP = { 1: 6, 2: 8, 3: 6, 4: 3, 5: 12, 6: 10, 7: 2 };
 const DROP_OF = { 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8 }; // mob -> mã vật phẩm
 function waterAt(x, y, z) {
   const k = Math.floor(x) + ',' + Math.floor(y) + ',' + Math.floor(z);
-  if (edits.has(k) || structure.has(k)) return false;
+  if (W.edits.has(k) || W.structure.has(k)) return false;
   const fy = Math.floor(y);
   return fy >= 1 && fy <= SEA && fy > heightAt(Math.floor(x), Math.floor(z));
 }
-const mobs = new Map(); // id -> {id,tc,x,y,z,yaw,hp,ai}
-const itemDrops = new Map(); // id -> {it,x,y,z,t0}
-let mobNextId = 1, dropNextId = 1;
-function countMobs(zombie) { let n = 0; for (const m of mobs.values()) { if (zombie ? (m.tc === 5) : (m.tc < 5)) n++; } return n; }
-function countTc(tc) { let n = 0; for (const m of mobs.values()) if (m.tc === tc) n++; return n; }
+/* mobs / itemDrops / mobNextId / dropNextId — xem newWorld() */
+function countMobs(zombie) { let n = 0; for (const m of W.mobs.values()) { if (zombie ? (m.tc === 5) : (m.tc < 5)) n++; } return n; }
+function countTc(tc) { let n = 0; for (const m of W.mobs.values()) if (m.tc === tc) n++; return n; }
 function spawnDrop(it, x, y, z) {
-  const id = dropNextId++;
-  itemDrops.set(id, { it, x, y, z, t0: Date.now() });
+  const id = W.dropNextId++;
+  W.itemDrops.set(id, { it, x, y, z, t0: Date.now() });
   broadcast({ type: 'drop', id, it, x: Math.round(x * 100) / 100, y, z: Math.round(z * 100) / 100 });
 }
-function stonesLeft() { let n = 0; for (const d of itemDrops.values()) if (d.it === STONE_IT) n++; return n; }
+function stonesLeft() { let n = 0; for (const d of W.itemDrops.values()) if (d.it === STONE_IT) n++; return n; }
 function spawnStones() {
   for (let i = 0; i < STONE_TOTAL; i++) {
     for (let t = 0; t < 60; t++) {
@@ -347,15 +453,15 @@ function spawnStones() {
       break;
     }
   }
-  console.log('🔮 Đã giấu ' + stonesLeft() + ' Đá Sức Mạnh trong bản đồ');
+  console.log('🔮 ' + W.id + ': đã giấu ' + stonesLeft() + ' Đá Sức Mạnh');
 }
 function matchMsg(p) {
-  return { type: 'match', start: matchStart, len: MATCH_LEN, left: stonesLeft(), mine: (p && p.stones) || 0 };
+  return { type: 'match', start: W.matchStart, len: MATCH_LEN, left: stonesLeft(), mine: (p && p.stones) || 0 };
 }
 function endMatch(winnerP, reason) {
-  if (matchOver) return;
-  matchOver = true;
-  const counts = [...players.values()].map(p => [p.name, p.stones || 0]).sort((a, b) => b[1] - a[1]);
+  if (W.matchOver) return;
+  W.matchOver = true;
+  const counts = [...wplayers()].map(p => [p.name, p.stones || 0]).sort((a, b) => b[1] - a[1]);
   let winner = winnerP ? winnerP.name : null;
   if (!winner && counts.length && counts[0][1] > 0 && (counts.length < 2 || counts[0][1] > counts[1][1])) winner = counts[0][0];
   broadcast({ type: 'gameover', winner, reason, counts: counts.slice(0, 8) });
@@ -363,16 +469,16 @@ function endMatch(winnerP, reason) {
   setTimeout(resetMatch, 12000);
 }
 function resetMatch() {
-  edits.clear();
-  itemDrops.clear();
-  for (const p of players.values()) p.stones = 0;
-  matchStart = Date.now(); matchOver = false;
+  W.edits.clear();
+  W.itemDrops.clear();
+  for (const p of wplayers()) p.stones = 0;
+  W.matchStart = Date.now(); W.matchOver = false;
   spawnStones();
   broadcast({ type: 'reset' });
   console.log('🔄 Ván mới bắt đầu!');
 }
 function mobDeath(m) {
-  mobs.delete(m.id);
+  W.mobs.delete(m.id);
   broadcast({ type: 'mobdie', id: m.id });
   const it = DROP_OF[m.tc];
   if (it) spawnDrop(it, m.x, m.y, m.z);
@@ -384,10 +490,10 @@ function boom(cx, cy, cz, r) {
       for (let z = Math.floor(cz - r); z <= Math.floor(cz + r); z++) {
         const dx = x + .5 - cx, dy = y + .5 - cy, dz = z + .5 - cz;
         if (dx * dx + dy * dy + dz * dz > rr) continue;
-        edits.set(x + ',' + y + ',' + z, 0);
+        W.edits.set(x + ',' + y + ',' + z, 0);
       }
   broadcast({ type: 'boom', x: cx, y: cy, z: cz, r });
-  for (const p of players.values()) {
+  for (const p of wplayers()) {
     if (p.hp <= 0 || Date.now() - p.spawnAt < 8000) continue;
     const d = Math.sqrt((p.x - cx) ** 2 + (p.y + .9 - cy) ** 2 + (p.z - cz) ** 2);
     if (d < 4.5) {
@@ -399,8 +505,8 @@ function boom(cx, cy, cz, r) {
   }
 }
 function spawnMob(tc, x, y, z) {
-  const id = mobNextId++;
-  mobs.set(id, { id, tc, x, y, z, yaw: 0, hp: MOB_HP[tc], ai: { state: 0, timer: Math.random() * 2, dx: 0, dz: 0, hitCd: 0, fleeT: 0, target: 0 } });
+  const id = W.mobNextId++;
+  W.mobs.set(id, { id, tc, x, y, z, yaw: 0, hp: MOB_HP[tc], ai: { state: 0, timer: Math.random() * 2, dx: 0, dz: 0, hitCd: 0, fleeT: 0, target: 0 } });
 }
 function spawnAnimal() {
   for (let i = 0; i < 12; i++) {
@@ -437,41 +543,42 @@ function spawnCreeperNear(p) {
     if (h > SEA) { spawnMob(6, x + .5, h + 1, z + .5); return; }
   }
 }
-for (let i = 0; i < 22; i++) spawnAnimal();
-for (let i = 0; i < 14; i++) spawnFish();
+/* sinh quái ban đầu chuyển xuống cuối file, chạy cho TỪNG thế giới */
 
-let animalT = 8, zombieT = 3, creeperT = 15, fishT = 6;
+/* Bộ đếm sinh quái nằm TRONG từng thế giới (xem newWorld) — nếu để toàn cục thì
+   hai bản đồ tranh nhau một bộ đếm, bản đồ nào cũng sinh quái nửa vời. */
 function mobTick(s) {
-  animalT -= s; zombieT -= s; creeperT -= s; fishT -= s;
-  if (animalT <= 0) { animalT = 8; if (countMobs(false) < 24) spawnAnimal(); }
-  if (fishT <= 0) { fishT = 6; if (countTc(7) < 16) spawnFish(); }
+  let animalT = W.animalT -= s, zombieT = W.zombieT -= s,
+      creeperT = W.creeperT -= s, fishT = W.fishT -= s;
+  if (animalT <= 0) { W.animalT = 8; if (countMobs(false) < 24) spawnAnimal(); }
+  if (fishT <= 0) { W.fishT = 6; if (countTc(7) < 16) spawnFish(); }
   if (zombieT <= 0) {
-    zombieT = 5;
-    const cap = Math.min(4 + players.size * 2, 30);
-    if (sunH() < -0.05 && players.size > 0 && countMobs(true) < cap) {
-      const list = [...players.values()];
+    W.zombieT = 5;
+    const cap = Math.min(4 + wcount() * 2, 30);
+    if (sunH() < -0.05 && wcount() > 0 && countMobs(true) < cap) {
+      const list = [...wplayers()];
       spawnZombieNear(list[(Math.random() * list.length) | 0]);
     }
   }
   if (creeperT <= 0) {
-    creeperT = 18;
-    const cap = Math.min(2 + Math.ceil(players.size / 2), 8);
-    if (players.size > 0 && countTc(6) < cap) {
-      const list = [...players.values()];
+    W.creeperT = 18;
+    const cap = Math.min(2 + Math.ceil(wcount() / 2), 8);
+    if (wcount() > 0 && countTc(6) < cap) {
+      const list = [...wplayers()];
       spawnCreeperNear(list[(Math.random() * list.length) | 0]);
     }
   }
   // vật phẩm: nhặt & hết hạn (Đá Sức Mạnh không bao giờ hết hạn)
   const now = Date.now();
-  if (!matchOver && now - matchStart > MATCH_LEN) endMatch(null, 'time');
-  for (const [id, d] of [...itemDrops]) {
-    if (d.it !== STONE_IT && now - d.t0 > 60000) { itemDrops.delete(id); broadcast({ type: 'took', id, by: 0 }); continue; }
-    if (matchOver) continue;
-    for (const p of players.values()) {
+  if (!W.matchOver && now - W.matchStart > MATCH_LEN) endMatch(null, 'time');
+  for (const [id, d] of [...W.itemDrops]) {
+    if (d.it !== STONE_IT && now - d.t0 > 60000) { W.itemDrops.delete(id); broadcast({ type: 'took', id, by: 0 }); continue; }
+    if (W.matchOver) continue;
+    for (const p of wplayers()) {
       if (p.hp <= 0) continue;
       const dd = Math.sqrt((p.x - d.x) ** 2 + (p.z - d.z) ** 2);
       if (dd < 1.5 && Math.abs(p.y - d.y) < 2.2) {
-        itemDrops.delete(id);
+        W.itemDrops.delete(id);
         broadcast({ type: 'took', id, by: p.id });
         if (d.it === STONE_IT) {
           p.stones = (p.stones || 0) + 1;
@@ -483,7 +590,7 @@ function mobTick(s) {
     }
   }
   const day = sunH() > 0.02;
-  for (const m of [...mobs.values()]) {
+  for (const m of [...W.mobs.values()]) {
     const a = m.ai; a.timer -= s; if (a.hitCd > 0) a.hitCd -= s; if (a.fleeT > 0) a.fleeT -= s;
     let speed = 0;
     if (m.tc === 7) { // cá bơi tự do trong nước
@@ -502,7 +609,7 @@ function mobTick(s) {
     }
     if (m.tc === 6) { // creeper
       let best = null, bd = 1e9;
-      for (const p of players.values()) {
+      for (const p of wplayers()) {
         if (p.hp <= 0 || p.fly) continue; // đang bay = creeper không rình
         const d = Math.sqrt((p.x - m.x) ** 2 + (p.z - m.z) ** 2);
         if (d < bd) { bd = d; best = p; }
@@ -511,7 +618,7 @@ function mobTick(s) {
         a.fuse -= s;
         if (bd > 4.8) { a.fuse = 0; }
         else if (a.fuse <= 0) {
-          mobs.delete(m.id);
+          W.mobs.delete(m.id);
           broadcast({ type: 'mobdie', id: m.id });
           boom(m.x, m.y + 1, m.z, 2.8);
           continue;
@@ -526,9 +633,9 @@ function mobTick(s) {
         speed = a.state === 1 ? 1.2 : 0;
       }
     } else if (m.tc === 5) {
-      if (day) { mobs.delete(m.id); broadcast({ type: 'mobdie', id: m.id, burn: 1 }); continue; }
+      if (day) { W.mobs.delete(m.id); broadcast({ type: 'mobdie', id: m.id, burn: 1 }); continue; }
       let best = null, bd = 40;
-      for (const p of players.values()) {
+      for (const p of wplayers()) {
         if (p.fly) continue; // đang bay = zombie không đuổi
         const d = Math.hypot(p.x - m.x, p.z - m.z);
         if (d < bd) { bd = d; best = p; }
@@ -566,11 +673,20 @@ function mobTick(s) {
 }
 
 const enc = (o) => JSON.stringify(o);
+/* CHỈ gửi cho người trong bản đồ đang xử lý — nếu không, khối xây ở làng sẽ hiện
+   ra giữa sân trường của người khác. */
 function broadcast(obj, exceptId) {
+  const s = enc(obj);
+  for (const p of players.values())
+    if (p.map === W.id && p.id !== exceptId && p.ws.readyState === 1) p.ws.send(s);
+}
+/* Gửi cho TẤT CẢ, bất kể bản đồ — Bảng Vàng và số người mỗi bản đồ dùng chung. */
+function broadcastAll(obj, exceptId) {
   const s = enc(obj);
   for (const p of players.values())
     if (p.id !== exceptId && p.ws.readyState === 1) p.ws.send(s);
 }
+function pushCounts() { broadcastAll({ type: 'counts', c: mapCounts() }); }
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
 wss.on('connection', (ws) => {
@@ -580,7 +696,9 @@ wss.on('connection', (ws) => {
     return;
   }
   const id = nextId++;
-  const p = { id, ws, name: 'Người chơi ' + id, x: 0.5, y: 96, z: 0.5, yaw: 0, hp: 20, lastAtk: 0, spawnAt: Date.now() };
+  /* `map` phải có giá trị NGAY từ đầu: wplayers()/broadcast lọc theo nó, nếu
+     undefined thì người chơi này vô hình với mọi người. 'hello' sẽ đổi sau. */
+  const p = { id, ws, map: 'campus', name: 'Người chơi ' + id, x: 0.5, y: 96, z: 0.5, yaw: 0, hp: 20, lastAtk: 0, spawnAt: Date.now() };
   players.set(id, p);
   let saidHello = false;
   p.blockCount = 0; p.chatCount = 0;
@@ -593,20 +711,30 @@ wss.on('connection', (ws) => {
     if (m.type === 'hello') {
       if (saidHello) return;
       saidHello = true;
+      /* Bản đồ: chỉ nhận tên có trong WORLDS. Tên lạ -> về sân trường, và client
+         được biết bằng trường `map` trong 'init' nên hai bên không lệch nhau. */
+      p.map = (typeof m.map === 'string' && WORLDS[m.map]) ? m.map : 'campus';
+      useWorld(p.map);
+      p.y = W.spawnY;
       p.name = String(m.name || p.name).slice(0, 16).replace(/[<>]/g, '') || ('Người chơi ' + id);
       ws.send(enc({
-        type: 'init', id, seed: SEED, time: Date.now(),
-        edits: [...edits.entries()],
-        players: [...players.values()].map(q => ({ id: q.id, name: q.name, x: q.x, y: q.y, z: q.z, yaw: q.yaw, app: q.app })),
-        drops: [...itemDrops.entries()].map(([di, d]) => [di, d.it, d.x, d.y, d.z]),
+        type: 'init', id, seed: SEED, time: Date.now(), map: p.map,
+        edits: [...W.edits.entries()],
+        players: [...wplayers()].map(q => ({ id: q.id, name: q.name, x: q.x, y: q.y, z: q.z, yaw: q.yaw, app: q.app })),
+        drops: [...W.itemDrops.entries()].map(([di, d]) => [di, d.it, d.x, d.y, d.z]),
       }));
       ws.send(JSON.stringify(boardMsg())); // gửi Bảng Vàng hiện tại cho người mới
       ws.send(JSON.stringify(matchMsg(p))); // và trạng thái ván chơi
       broadcast({ type: 'join', p: { id, name: p.name, x: p.x, y: p.y, z: p.z, yaw: p.yaw, app: p.app } }, id);
-      console.log(`[+] ${p.name} (#${id}) vào — ${players.size}/${MAX_PLAYERS}`);
+      pushCounts();
+      console.log(`[+] ${p.name} (#${id}) vào ${W.id} — ${players.size}/${MAX_PLAYERS}`);
       return;
     }
     if (!saidHello) return;
+    /* ⭐ CỬA VÀO 1: từ đây trở xuống mọi hàm đều đọc/ghi `W`, nên phải trỏ `W` vào
+       thế giới của NGƯỜI GỬI. Thiếu dòng này là lỗi nặng nhất có thể xảy ra:
+       người ở làng đặt khối thì khối rơi vào thế giới sân trường. */
+    useWorld(p.map);
 
     if (m.type === 'pos') {
       if (!isNum(m.x) || !isNum(m.y) || !isNum(m.z) || !isNum(m.yaw)) return;
@@ -623,7 +751,7 @@ wss.on('connection', (ws) => {
       return;
     }
     if (m.type === 'block') {
-      if (matchOver) return; // hết ván — chờ ván mới
+      if (W.matchOver) return; // hết ván — chờ ván mới
       if (p.blockCount++ > 40) return; // chống spam (reset mỗi giây)
       if (!Number.isInteger(m.x) || !Number.isInteger(m.y) || !Number.isInteger(m.z)) return;
       if (m.x < -WORLD_R || m.x >= WORLD_R || m.z < -WORLD_R || m.z >= WORLD_R) return;
@@ -640,18 +768,28 @@ wss.on('connection', (ws) => {
       // Server KHÔNG cần biết khối trông thế nào: nó chỉ lưu mã và phát lại cho
       // mọi người; hình ảnh do client quyết định. Nhưng nếu không mở khoá ở đây thì
       // người chơi đặt xong khối sẽ "bật lại" vì server không lưu và không phát đi.
-      const T_MAX = 48;
-      const T_BANNED = (t === 11) || (t >= 12 && t <= 15);
+      /* ═══ Mã khối được phép đặt ═══
+         Trước là 48 — đúng bằng số khối đang có. Nay nâng lên 250 và CHỪA SẴN dải
+         mã, để lần sau thêm khối xây dựng chỉ cần cập nhật Netlify, KHÔNG phải sửa
+         và deploy lại server nữa (mỗi lần deploy là một lần bạn phải làm tay).
+         Server không cần biết khối trông thế nào — nó chỉ lưu con số rồi phát lại.
+         Danh sách CẤM thì vẫn phải giữ nguyên ý nghĩa:
+           11        = đá gốc (lớp đáy thế giới, cho đặt thì bịt hoặc phá được đáy)
+           12–15     = 4 loại quặng (phải ĐÀO mới có, cho đặt là quặng vô hạn)
+           49–99     = chừa cho khối tương lai NHƯNG chưa có ảnh -> tạm cấm để
+                       không ai đặt được khối trắng trơn rồi tưởng game lỗi */
+      const T_MAX = 250;
+      const T_BANNED = (t === 11) || (t >= 12 && t <= 15) || (t >= 49 && t <= 99);
       if (t < 0 || t > T_MAX || T_BANNED) return;
       const k = m.x + ',' + m.y + ',' + m.z;
       if (t === 0) { // đào: nếu khối gốc là QUẶNG thì rơi nguyên liệu
-        const prev = edits.get(k);
-        if (prev === undefined && !structure.has(k) && m.y <= heightAt(m.x, m.z)) {
+        const prev = W.edits.get(k);
+        if (prev === undefined && !W.structure.has(k) && m.y <= heightAt(m.x, m.z)) {
           const ore = oreAt(m.x, m.y, m.z);
           if (ore) spawnDrop(ORE_IT[ore], m.x + .5, m.y, m.z + .5);
         }
       }
-      edits.set(k, t);
+      W.edits.set(k, t);
       broadcast({ type: 'block', x: m.x, y: m.y, z: m.z, t }, id);
       return;
     }
@@ -659,7 +797,7 @@ wss.on('connection', (ws) => {
       const now = Date.now();
       if (now - p.lastAtk < 190) return;
       p.lastAtk = now;
-      const mob = mobs.get(m.id | 0);
+      const mob = W.mobs.get(m.id | 0);
       if (!mob) { if (process.env.DEBUG) console.log('atk: no mob', m.id); return; }
       const w = m.w | 0; // 0 tay/cuốc, 1 kiếm, 2 tên, 3 thước kẻ, 4 compa, 5 kiếm lửa, 6 kiếm băng, 7 cung sấm, 8 kiếm sắt, 9 kiếm vàng, 10 cung hồng ngọc
       const DMG = { 0: 2, 1: 8, 2: 6, 3: 14, 4: 10, 5: 16, 6: 14, 7: 14, 8: 18, 9: 22, 10: 18 };
@@ -703,17 +841,17 @@ wss.on('connection', (ws) => {
         p.caughtCd = Date.now();
         statOf(p).caught++;
         broadcast({ type: 'caught', id, k, t }, id);
-        broadcast(boardMsg());
+        broadcastAll(boardMsg());
       }
       return;
     }
     if (m.type === 'stat') { // 🏆 thống kê Bảng Vàng: esc = thoát truy đuổi, ans = số câu đúng
       const now = Date.now();
       if (m.k === 'esc') {
-        if (!p.escCd || now - p.escCd > 8000) { p.escCd = now; statOf(p).esc++; broadcast(boardMsg()); }
+        if (!p.escCd || now - p.escCd > 8000) { p.escCd = now; statOf(p).esc++; broadcastAll(boardMsg()); }
       } else if (m.k === 'ans') {
         const n = Math.max(1, Math.min(10, m.n | 0));
-        if (!p.ansCd || now - p.ansCd > 2000) { p.ansCd = now; statOf(p).ans += n; broadcast(boardMsg()); }
+        if (!p.ansCd || now - p.ansCd > 2000) { p.ansCd = now; statOf(p).ans += n; broadcastAll(boardMsg()); }
       }
       return;
     }
@@ -756,8 +894,10 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     players.delete(id);
     if (saidHello) {
+      useWorld(p.map);              // ⭐ CỬA VÀO 3: 'leave' chỉ gửi trong bản đồ đó
       broadcast({ type: 'leave', id });
-      console.log(`[-] ${p.name} (#${id}) rời — ${players.size}/${MAX_PLAYERS}`);
+      pushCounts();
+      console.log(`[-] ${p.name} (#${id}) rời ${p.map} — ${players.size}/${MAX_PLAYERS}`);
     }
   });
   ws.on('error', () => {});
@@ -767,13 +907,21 @@ wss.on('connection', (ws) => {
 const r2 = v => Math.round(v * 100) / 100;
 setInterval(() => {
   if (players.size === 0) return;
-  mobTick(0.1);
-  broadcast({ type: 'pos', p: [...players.values()].map(p => [p.id, p.x, p.y, p.z, p.yaw, p.drv ? 1 : 0, p.fly ? 1 : 0]) });
-  broadcast({ type: 'mobs', m: [...mobs.values()].map(m => [m.id, m.tc, r2(m.x), r2(m.y), r2(m.z), r2(m.yaw)]) });
+  /* ⭐ CỬA VÀO 2: quét từng thế giới. Bản đồ không có ai thì BỎ QUA hẳn — quan
+     trọng với gói Render Free: nếu vẫn mô phỏng quái ở bản đồ trống thì tốn CPU
+     gấp đôi mà không ai thấy. */
+  for (const id in WORLDS) {
+    useWorld(id);
+    if (wcount() === 0) continue;
+    mobTick(0.1);
+    broadcast({ type: 'pos', p: wplayers().map(p => [p.id, p.x, p.y, p.z, p.yaw, p.drv ? 1 : 0, p.fly ? 1 : 0]) });
+    broadcast({ type: 'mobs', m: [...W.mobs.values()].map(m => [m.id, m.tc, r2(m.x), r2(m.y), r2(m.z), r2(m.yaw)]) });
+  }
 }, 100);
 
 // Reset bộ đếm chống spam + hồi máu
 setInterval(() => {
+  /* chống spam & hồi máu áp dụng cho MỌI người, không phân biệt bản đồ */
   for (const p of players.values()) { p.blockCount = 0; p.chatCount = 0; p.arrowCount = 0; }
 }, 1000);
 setInterval(() => {
@@ -785,7 +933,31 @@ setInterval(() => {
   }
 }, 3000);
 
-spawnStones();
+/* ═══════════ 🏗️ DỰNG TỪNG THẾ GIỚI LÚC KHỞI ĐỘNG ═══════════
+   Sân trường: công trình do buildStructure() dựng bằng code (như trước).
+   Làng: 97.860 khối đọc từ public/maps/village.json — CÙNG file mà client tải, nên
+   hai bên không thể lệch nhau. Không có file thì server vẫn chạy, chỉ là quái vật
+   đi xuyên nhà (server không biết nhà ở đâu) — không làm người chơi rơi, vì va chạm
+   do client tính. */
+function loadVillage() {
+  const f = path.join(__dirname, 'public', 'maps', 'village.json');
+  try {
+    const d = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const w = WORLDS.village;
+    w.pads = d.pads || [];
+    let n = 0;
+    for (const t in d.b) {
+      const a = d.b[t], tt = t | 0;
+      for (let i = 0; i < a.length; i += 3) { w.structure.set(a[i] + ',' + a[i + 1] + ',' + a[i + 2], tt); n++; }
+    }
+    console.log('🏘️  Làng Khởi Đầu: ' + n + ' khối, ' + w.pads.length + ' vùng san nền');
+  } catch (e) {
+    console.log('⚠️  Không đọc được public/maps/village.json (' + e.code + ') — bản đồ Làng vẫn chơi được, nhưng quái vật sẽ đi xuyên nhà.');
+  }
+}
+loadVillage();
+for (const id in WORLDS) { useWorld(id); spawnStones(); for (let i = 0; i < 22; i++) spawnAnimal(); for (let i = 0; i < 14; i++) spawnFish(); }
+useWorld('campus');
 server.listen(PORT, () => {
   console.log('==========================================');
   console.log('  KhốiCraft Online — máy chủ đã sẵn sàng!');
