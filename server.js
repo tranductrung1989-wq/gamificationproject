@@ -19,11 +19,30 @@ const TRACK = {x0:33, x1:75, z0:-1, z1:31, H:12, cx:54, cz:15, rx:18, rz:13};
 const INDEX = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
 const THREE_JS = fs.readFileSync(path.join(__dirname, 'public', 'three.min.js'));
 
+// 🖼️ Texture HD: public/tex/256/*.webp, public/tex/512/*.webp — chỉ tải khi người chơi chọn Vừa/Cao.
+// Đọc theo yêu cầu (không giữ RAM) + cho trình duyệt cache 30 ngày.
+const TEX_DIR = path.join(__dirname, 'public', 'tex');
+const TEX_MIME = { '.webp': 'image/webp', '.png': 'image/png', '.json': 'application/json; charset=utf-8' };
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
   if (req.url.startsWith('/three.min.js')) {
     res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=86400' });
     res.end(THREE_JS);
+    return;
+  }
+  if (req.url.startsWith('/tex/')) {
+    const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/tex\//, '');
+    const file = path.join(TEX_DIR, rel);
+    if (!file.startsWith(TEX_DIR + path.sep) || !/\.(webp|png|json)$/.test(file)) { res.writeHead(403); res.end(); return; }
+    fs.readFile(file, (err, data) => {
+      if (err) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, {
+        'Content-Type': TEX_MIME[path.extname(file)] || 'application/octet-stream',
+        'Cache-Control': path.extname(file) === '.json' ? 'no-cache' : 'public, max-age=2592000, immutable'
+      });
+      res.end(data);
+    });
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -575,7 +594,20 @@ wss.on('connection', (ws) => {
       if (m.x < -WORLD_R || m.x >= WORLD_R || m.z < -WORLD_R || m.z >= WORLD_R) return;
       if (m.y < 1 || m.y >= WORLD_H) return; // y=0 là đá gốc, không sửa được
       const t = m.t | 0;
-      if (t < 0 || t > 10) return;           // không cho đặt đá gốc (11) hay quặng (12-15)
+      // 🧱 Mã khối được phép ĐẶT.
+      //   1–10  khối cơ bản (cỏ, đất, đá, gỗ, lá, cát, nước, ván, gạch, kính)
+      //   11    đá gốc  — CẤM, để không ai bịt đáy thế giới
+      //   12–15 quặng   — CẤM, phải đào mới có, không được tự đặt ra
+      //   16–24 khối trang trí worldgen dùng (sa thạch, gạch đá, đá cuội, bạch dương,
+      //         thông, sỏi, đá cuội rêu) — CHO phép đặt từ giai đoạn 3
+      //   25–48 bảng khối xây dựng mở rộng (len, bê tông, quartz, kính màu, băng,
+      //         tuyết, đá phát sáng, khối kim cương…) — thêm ở giai đoạn 3
+      // Server KHÔNG cần biết khối trông thế nào: nó chỉ lưu mã và phát lại cho
+      // mọi người; hình ảnh do client quyết định. Nhưng nếu không mở khoá ở đây thì
+      // người chơi đặt xong khối sẽ "bật lại" vì server không lưu và không phát đi.
+      const T_MAX = 48;
+      const T_BANNED = (t === 11) || (t >= 12 && t <= 15);
+      if (t < 0 || t > T_MAX || T_BANNED) return;
       const k = m.x + ',' + m.y + ',' + m.z;
       if (t === 0) { // đào: nếu khối gốc là QUẶNG thì rơi nguyên liệu
         const prev = edits.get(k);
