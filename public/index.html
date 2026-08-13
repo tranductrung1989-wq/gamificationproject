@@ -361,6 +361,7 @@
   <div id="controls">
     <b>Di chuyển</b> W A S D &nbsp;·&nbsp; <b>Nhảy</b> Space &nbsp;·&nbsp; <b>Bay</b> F<br>
     <b>Phá khối / Đánh</b> Chuột trái &nbsp;·&nbsp; <b>Đặt khối</b> Chuột phải<br>
+    <b style="color:#ffd97a">Cầm CUỐC (phím 3) là làm được cả hai — trái đào, phải đặt. Không cần đổi ô.</b><br>
     <b>Chọn ô</b> Phím 1–9, 0 (1 Kiếm ⚔️ · 2 Cung 🏹 · <b>3 Cuốc ⛏️ để đào</b> · 4–0 Khối xây)<br>
     <b>Kho khối</b> Phím G &nbsp;·&nbsp; <b>Ăn hồi máu</b> Phím E &nbsp;·&nbsp; <b>Chat</b> T &nbsp;·&nbsp; <b>Tạm dừng</b> Esc<br>
     <span style="color:#c9b8ff">🔮 Gặp <b>Hiền Giả Bí Ẩn</b>, trả lời đúng câu hỏi để nhận Kim cương 💎!</span>
@@ -450,9 +451,6 @@ const SWORD=100, BOW=101, PICK=102; // dụng cụ (không phải khối)
 const NAMES = {1:'Cỏ',2:'Đất',3:'Đá',4:'Gỗ',5:'Lá cây',6:'Cát',7:'Nước',8:'Ván gỗ',9:'Gạch',10:'Kính',11:'Đá gốc',100:'Kiếm',101:'Cung',102:'Cuốc'};
 const TRANSPARENT = {7:true,10:true};
 const HOTBAR = [SWORD,BOW,PICK,T.GRASS,T.DIRT,T.STONE,T.LOG,T.PLANK,T.BRICK,T.GLASS];
-/* ⚠️ Cây thật của Tree Pack tốn lá gấp nhiều lần cây vẽ tay: đo thực tế lá thông
-   chạm trần 13.000/13.000 và bắt đầu MẤT KHỐI (rebuildMeshes lặng lẽ bỏ qua).
-   Nâng riêng nhóm lá và thân cây. Mỗi 1.000 sức chứa tốn 64 KB bộ nhớ GPU. */
 const CAPS = {1:56000,2:38000,3:42000,4:17000,5:38000,6:16000,7:22000,8:20000,9:12000,10:10000,11:14000,12:4000,13:4000,14:3000,15:3000,16:14000,17:11000,18:6000,19:10000,20:19000,21:13000,22:28000,23:5000,24:3000};
 
 /* ═══════════ 🧱 BẢNG KHỐI XÂY DỰNG MỞ RỘNG (mã 25–50) ═══════════
@@ -1078,6 +1076,65 @@ function bget(x,y,z){
   return deepAt(x,y,z)||undefined;
 }
 
+/* Dấu chân của một mẫu cây: danh sách cột (x,z) mà cây có khối. Tính một lần rồi nhớ
+   luôn vào mẫu — tính lại cho từng chỗ trồng thì tốn gấp mấy trăm lần. */
+function treeFoot(tk){
+  if(tk._f)return tk._f;
+  const seen=new Set(),f=[];
+  for(const t in tk.b){
+    const a=tk.b[t];
+    for(let i=0;i<a.length;i+=3){
+      const k=a[i]*1000+a[i+2];
+      if(!seen.has(k)){seen.add(k);f.push(a[i],a[i+2]);}
+    }
+  }
+  return (tk._f=f);
+}
+/* Đóng dấu một cây, gốc tại (x,z), mặt đất y=gy. Trả về true nếu trồng được.
+   Ba phép thử, và cả ba phải xong TRƯỚC khi đặt khối đầu tiên — xem ghi chú đầu file. */
+function stampTree(tk,x,gy,z){
+  const bx=x-tk.cx,bz=z-tk.cz;
+  if(bx<-WORLD_R+2||bx+tk.w>WORLD_R-2||bz<-WORLD_R+2||bz+tk.l>WORLD_R-2)return false;
+  if(gy+1+tk.h>=WORLD_H)return false;
+  const f=treeFoot(tk);
+  for(let i=0;i<f.length;i+=2){          // nền phải phẳng, không thì cây lơ lửng
+    if(heightAt(bx+f[i],bz+f[i+1])!==gy)return false;
+  }
+  for(const t in tk.b){                  // không đè lên bất cứ thứ gì đã có
+    const a=tk.b[t];
+    for(let i=0;i<a.length;i+=3){
+      if(blocks.has(K(bx+a[i],gy+1+a[i+1],bz+a[i+2])))return false;
+    }
+  }
+  for(const t in tk.b){
+    const a=tk.b[t],tt=+t;
+    for(let i=0;i<a.length;i+=3) blocks.set(K(bx+a[i],gy+1+a[i+1],bz+a[i+2]),tt);
+  }
+  return true;
+}
+/* Rải cây khắp bản đồ. Cùng SEED -> mọi máy trồng ở đúng các chỗ giống nhau, nên hai
+   học sinh đứng cạnh nhau thấy cùng một khu rừng mà server không phải gửi gì. */
+function scatterTrees(){
+  if(!MAPDATA||!MAPDATA.trees||!MAPDATA.trees.length)return 0;
+  const big=MAPDATA.trees.filter(t=>t.k==='big');
+  const bush=MAPDATA.trees.filter(t=>t.k!=='big');
+  const P=MAPDATA.scatter||{big:0.004,bush:0.010};
+  let n=0;
+  for(let x=-WORLD_R+4;x<WORLD_R-4;x++)for(let z=-WORLD_R+4;z<WORLD_R-4;z++){
+    const r=hsh(x*3+11,z*5+7);
+    let list;
+    if(r<P.big)list=big;
+    else if(r<P.big+P.bush)list=bush;
+    else continue;
+    if(!list.length)continue;
+    const h=heightAt(x,z);
+    if(h<=SEA+1)continue;                                        // dưới nước
+    if(blocks.has(K(x,h+1,z))||blocks.has(K(x,h+2,z)))continue;  // có công trình
+    if(stampTree(list[(hsh3(x,31,z)*list.length)|0],x,h,z))n++;
+  }
+  return n;
+}
+let KC_TREES=0;
 function generate(){
   if(IS_V){genVillage();return;}
   blocks.clear();visible.clear();
@@ -1114,76 +1171,6 @@ function generate(){
   buildPaths();
   buildDecor();
 }
-/* ═══════════ 🌳 CÂY THẬT (Tree Pack của GraySun) ═══════════
-   `MAPDATA.trees` là 12 mẫu cây; `MAPDATA.scatter` là mật độ mỗi nhóm.
-   Đóng dấu một mẫu = chép khối của nó vào `blocks`, canh sao cho GỐC cây rơi đúng
-   cột (x,z) đã chọn và đáy cây nằm ngay trên mặt đất.
-
-   KHÔNG ghi đè khối đã có: cây mọc sau công trình, nên nếu cành chạm vào mái nhà
-   thì nhường nhà. Nhờ vậy không cần kiểm tra va chạm phức tạp lúc chọn chỗ. */
-function stampTree(tk, x, gy, z){
-  const T2=MAPDATA.trees[tk]; if(!T2) return 0;
-  const ox=x-T2.cx, oz=z-T2.cz;
-  let n=0;
-  for(const t in T2.b){
-    const a=T2.b[t], tt=+t;
-    for(let i=0;i<a.length;i+=3){
-      const X=ox+a[i], Y=gy+a[i+1], Z=oz+a[i+2];
-      if(X<-WORLD_R||X>=WORLD_R||Z<-WORLD_R||Z>=WORLD_R||Y<1||Y>=WORLD_H) continue;
-      const k=K(X,Y,Z);
-      if(blocks.has(k)) continue;
-      blocks.set(k,tt); n++;
-    }
-  }
-  return n;
-}
-/* Rải cây khắp bản đồ. Duyệt theo lưới thưa chứ không duyệt từng cột: cây to 20 khối
-   nên đặt sát nhau là chồng lên nhau, vừa xấu vừa tốn khối. */
-function scatterTrees(){
-  if(!MAPDATA||!MAPDATA.trees||!MAPDATA.scatter) return 0;
-  const keys={big:[],bush:[]};
-  for(const k in MAPDATA.trees) keys[MAPDATA.trees[k].g].push(k);
-  keys.big.sort(); keys.bush.sort();        // thứ tự cố định -> mọi máy giống nhau
-  const SC=MAPDATA.scatter;
-  let n=0, nb=0, nh=0;
-  /* ⚠️ KHÔNG dùng padDist để loại trừ. Vùng san nền phủ 82% bản đồ (dấu chân làng
-     một mình đã 118×122), nên loại theo pad thì cả bản đồ chỉ còn ~8 chỗ trồng được.
-     Cái cần tránh là ĐÈ LÊN CÔNG TRÌNH, mà việc đó `stampTree` đã lo (không ghi đè
-     khối có sẵn). Ở đây chỉ cần: đừng mọc NGAY TRÊN nền công trình. */
-  let elig=0;
-  for(let x=-WORLD_R+6;x<WORLD_R-6;x++)for(let z=-WORLD_R+6;z<WORLD_R-6;z++){
-    if(inLake(x,z,4)||inTrack(x,z,3)) continue;
-    const P3=MAPS.village.plaza;
-    if(x>=P3.x0-3&&x<=P3.x1+3&&z>=P3.z0-3&&z<=P3.z1+3) continue;   // chừa quảng trường chợ
-    const h=heightAt(x,z);
-    if(h<=SEA+1) continue;                  // không trồng dưới nước
-    if(blocks.has(K(x,h+1,z))||blocks.has(K(x,h+2,z))) continue;   // đã có công trình ở đây
-    elig++;
-    const r=hsh(x*3+11,z*5+7);
-    let tk=null;
-    if(r<SC.big){
-      const L=keys.big; tk=L[(hsh3(x,5,z)*L.length)|0];
-    }else if(r<SC.big+SC.bush){
-      const L=keys.bush; tk=L[(hsh3(x,9,z)*L.length)|0];
-    }
-    if(!tk) continue;
-    /* Mặt đất phải TƯƠNG ĐỐI PHẲNG dưới gốc, nếu không cây lơ lửng hoặc lún nửa thân.
-       Kiểm 4 góc quanh gốc; chênh quá 1 khối thì bỏ chỗ này. */
-    const T2=MAPDATA.trees[tk];
-    if(T2.g==='big'){
-      let bad=false;
-      for(const [dx,dz] of [[-2,0],[2,0],[0,-2],[0,2]]) if(Math.abs(heightAt(x+dx,z+dz)-h)>1){bad=true;break;}
-      if(bad) continue;
-    }
-    const got=stampTree(tk,x,h+1,z);
-    n+=got; if(T2.g==='big')nb++;else nh++;
-  }
-  KC_TREES=[nb,nh,n,elig];
-  return n;
-}
-let KC_TREES=[0,0,0];
-let KC_GENMS=0, KC_MESHMS=0;
-
 /* ═══════════ 🏘️ SINH BẢN ĐỒ LÀNG ═══════════
    Ba bước: (1) đất + nước, (2) cây ngoài làng, (3) đặt 97.860 khối build.
    Build đặt SAU CÙNG nên nó ghi đè lên đất — đúng ý: nhà phải đè lên nền. */
@@ -1205,15 +1192,28 @@ function genVillage(){
     }
     for(let y=h+1;y<=SEA;y++) blocks.set(K(x,y,z),T.WATER);
   }
-  /* Cây: dùng MẪU CÂY THẬT của Tree Pack thay cho plantTree() vẽ tay.
-     Chỉ mọc ngoài làng và ngoài đường đua — trong làng đã có cây của build rồi. */
-  /* ── khối build ── (đặt TRƯỚC cây, vì stampTree không ghi đè khối đã có) ── */
+  /* cây: chỉ ở ngoài làng và ngoài đường đua — trong làng đã có cây của build rồi */
+  for(let x=-WORLD_R+3;x<WORLD_R-3;x++)for(let z=-WORLD_R+3;z<WORLD_R-3;z++){
+    /* Có mẫu cây thật thì bỏ hẳn cây thủ tục — trộn cả hai thì quả cầu lá cũ đứng
+       cạnh cây dựng tay, nhìn ra ngay cái nào là đồ đắp vội. Không có mẫu (file bản
+       đồ cũ) thì vẫn chạy đường cũ, bản đồ không bị trọc. */
+    if(MAPDATA&&MAPDATA.trees&&MAPDATA.trees.length)continue;
+    if(padDist(x,z)<=6||inLake(x,z,3)||inTrack(x,z,2))continue;
+    const h=heightAt(x,z);
+    if(h>SEA+1&&hsh(x*3+11,z*5+7)<0.030){
+      const tv=hsh(x*7+3,z*11+5);
+      plantTree(x,z,h,4+((hsh(x,z)*2)|0),tv<0.45?0:tv<0.75?1:2);
+    }
+  }
+  /* ── khối build ── */
   if(MAPDATA&&MAPDATA.b){
     for(const t in MAPDATA.b){
       const a=MAPDATA.b[t],tt=+t;
       for(let i=0;i<a.length;i+=3) blocks.set(K(a[i],a[i+1],a[i+2]),tt);
     }
   }
+  /* ── cây thật, đóng dấu từ mẫu ── */
+  KC_TREES=scatterTrees();
   /* ── dọn quảng trường chợ ──
      Phá cây và ruộng để có chỗ dựng quầy hàng, NHƯNG giữ nước: nếu quét sạch rồi
      lấp cỏ toàn bộ thì mặt hồ/sông trong vùng biến thành một mảng cỏ vuông vức,
@@ -1227,7 +1227,6 @@ function genVillage(){
   }
   buildVTrack();
   buildTrack();     // ray tàu lượn 4WD, dùng TRACK_PTS đã dịch sang làng
-  scatterTrees();   // 🌳 cây mọc SAU CÙNG: nhường nhà, nhường đường, nhường ray
 }
 /* đường đua ngoài đảo — dùng lại đúng cách vẽ của sân trường, chỉ đổi toạ độ */
 function buildVTrack(){
@@ -4036,6 +4035,64 @@ function buildHeldMini(sel){ // vật cầm tay cho avatar (góc nhìn 3)
   g.rotation.x=.4;
   return g;
 }
+/* ---------- ÉP DẸT TRANH VẬT PHẨM THÀNH VẬT THỂ 3D ---------- */
+const IT3D_CACHE={};
+function item3D(key,cb){
+  if(IT3D_CACHE[key]){cb(IT3D_CACHE[key].clone());return;}
+  const src=AT[key];
+  if(!src)return;
+  const img=new Image();
+  img.onload=()=>{
+    const N=16;                       // lưới lấy mẫu đường viền
+    const cv=document.createElement('canvas');
+    cv.width=cv.height=N;
+    const cx=cv.getContext('2d');
+    cx.drawImage(img,0,0,N,N);
+    const d=cx.getImageData(0,0,N,N).data;
+    const on=(i,j)=>(i<0||j<0||i>=N||j>=N)?false:d[(j*N+i)*4+3]>64;
+    /* Nửa bề dày. Vật phẩm rộng 1 đơn vị = N pixel, Minecraft dày 1.6 pixel, nên
+          nửa bề dày = 0.8/N. Lần đầu tôi viết z=±TH*N/2 với TH=1.6/N — hoá ra là ±0.8,
+          tức DÀY GẤP 16 LẦN chiều rộng: trên tay hiện ra một tấm ván dài sọc đen thay
+          vì cây kiếm. Ảnh chụp mới nhìn ra. */
+       const HZ=0.8/N;
+    const pos=[],uv=[],nor=[];
+    const P=(x,y,z,u,v,nx,ny,nz)=>{pos.push(x,y,z);uv.push(u,v);nor.push(nx,ny,nz);};
+    const quad=(a,b,c,d2)=>{P(...a);P(...b);P(...c);P(...a);P(...c);P(...d2);};
+    /* Mặt trước và mặt sau trải TOÀN BỘ ảnh gốc (không phải 16×16 vừa lấy mẫu):
+       alphaTest tự cắt phần trong suốt, nên vẫn giữ nguyên chi tiết 128px. */
+    const H=.5;
+    quad([-H,-H,HZ,0,0,0,0,1],[H,-H,HZ,1,0,0,0,1],
+         [H,H,HZ,1,1,0,0,1],[-H,H,HZ,0,1,0,0,1]);
+    quad([H,-H,-HZ,1,0,0,0,-1],[-H,-H,-HZ,0,0,0,0,-1],
+         [-H,H,-HZ,0,1,0,0,-1],[H,H,-HZ,1,1,0,0,-1]);
+    /* Vành: chỉ dựng ở những cạnh mà một bên đục, một bên trong suốt — tức là
+       đúng đường viền của hình. Đây là thứ làm cây kiếm nhìn nghiêng vẫn ra kiếm. */
+    const z0=-HZ,z1=HZ;
+    for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+      if(!on(i,j))continue;
+      const x0=-H+i/N,x1=-H+(i+1)/N,y1=H-j/N,y0=H-(j+1)/N;
+      const u0=i/N,u1=(i+1)/N,v0=1-(j+1)/N,v1=1-j/N;
+      if(!on(i,j-1))quad([x0,y1,z0,u0,v1,0,1,0],[x1,y1,z0,u1,v1,0,1,0],
+                         [x1,y1,z1,u1,v1,0,1,0],[x0,y1,z1,u0,v1,0,1,0]);
+      if(!on(i,j+1))quad([x1,y0,z0,u1,v0,0,-1,0],[x0,y0,z0,u0,v0,0,-1,0],
+                         [x0,y0,z1,u0,v0,0,-1,0],[x1,y0,z1,u1,v0,0,-1,0]);
+      if(!on(i-1,j))quad([x0,y0,z0,u0,v0,-1,0,0],[x0,y1,z0,u0,v1,-1,0,0],
+                         [x0,y1,z1,u0,v1,-1,0,0],[x0,y0,z1,u0,v0,-1,0,0]);
+      if(!on(i+1,j))quad([x1,y1,z0,u1,v1,1,0,0],[x1,y0,z0,u1,v0,1,0,0],
+                         [x1,y0,z1,u1,v0,1,0,0],[x1,y1,z1,u1,v1,1,0,0]);
+    }
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+    geo.setAttribute('uv',new THREE.Float32BufferAttribute(uv,2));
+    geo.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));
+    const mat=new THREE.MeshLambertMaterial({map:atex(key,{noMip:true}),
+      alphaTest:0.5,side:THREE.FrontSide,transparent:false});
+    const mesh=new THREE.Mesh(geo,mat);
+    IT3D_CACHE[key]=mesh;
+    cb(mesh.clone());
+  };
+  img.src=src;
+}
 function updateHandItem(){
   if(handItem){handGroup.remove(handItem);handItem=null;}
   const g=new THREE.Group();
@@ -4043,7 +4100,29 @@ function updateHandItem(){
   arm.position.set(.04,-.14,.16);arm.rotation.x=0.45;
   g.add(arm);
   const sel=HOTBAR[selIdx];
-  if(sel===SWORD){ // kiếm trong tay (màu + hiệu ứng theo loại đang trang bị)
+  /* Tranh của resource pack cho món đang cầm. Không có tranh thì rơi về hộp cũ. */
+  const it3dKey = sel===SWORD ? ('i_sw'+Math.min(swordVar,5))
+                : sel===PICK  ? 'i_pick'
+                : sel===BOW   ? 'i_bow' : null;
+  const has3D = !!(it3dKey&&AT[it3dKey]);
+  if(has3D){
+    item3D(it3dKey,m=>{
+      if(sel===BOW){
+        m.scale.setScalar(0.50);
+        m.position.set(-.13,.15,-.05);
+        m.rotation.set(0,-0.15,0.10);
+        m.material=m.material.clone();
+        m.material.color.setHex(BW_VARS[bowVar].col);
+      }else{
+        m.scale.setScalar(0.46);
+        m.position.set(-.10,.18,-.06);
+        m.rotation.set(0,-0.30,0.30);
+      }
+      /* gắn vào `g`, KHÔNG phải handItem — xem ghi chú đầu file */
+      g.add(m);
+    });
+  }
+  if(sel===SWORD&&!has3D){ // kiếm trong tay (màu + hiệu ứng theo loại đang trang bị)
     const s=new THREE.Group();
     const sv=SW_VARS[swordVar];
     const blade=new THREE.Mesh(new THREE.BoxGeometry(.05,.52,.1),lamb2(sv.col,sv.fx?sv.col:0x33424f));
@@ -4056,7 +4135,7 @@ function updateHandItem(){
     s.position.set(-.02,.02,-.06);
     s.rotation.set(0.55,0,-0.18);
     g.add(s);
-  }else if(sel===PICK){ // cuốc trong tay
+  }else if(sel===PICK&&!has3D){ // cuốc trong tay
     const s=new THREE.Group();
     const handle=new THREE.Mesh(new THREE.BoxGeometry(.06,.5,.06),lamb2(0x6b4a2a));
     handle.position.y=.12;
@@ -4067,7 +4146,7 @@ function updateHandItem(){
     s.position.set(-.02,.0,-.06);
     s.rotation.set(0.55,0,-0.2);
     g.add(s);
-  }else if(sel===BOW){ // cung trong tay
+  }else if(sel===BOW&&!has3D){ // cung trong tay
     const bw=new THREE.Group();
     const col=BW_VARS[bowVar].col;
     for(let i=0;i<7;i++){
@@ -4081,7 +4160,7 @@ function updateHandItem(){
     bw.position.set(-.04,.06,-.08);
     bw.rotation.set(0.15,0.45,0.1);
     g.add(bw);
-  }else{ // khối xây trong tay
+  }else if(sel<100){ // khối xây trong tay
     const cube=new THREE.Mesh(new THREE.BoxGeometry(.25,.25,.25),MATS[sel]);
     cube.position.set(-.02,.04,-.06);
     cube.rotation.set(0.35,0.65,0);
@@ -4357,15 +4436,9 @@ function startWorld(){
   worldReady=true;
   setStatus('Đang tạo thế giới...');
   kcLoadMapData(()=>setTimeout(()=>{
-    /* Đo thời gian sinh thế giới để còn biết bản đồ nặng thêm bao nhiêu khi thêm
-       công trình — đây là con số học sinh cảm nhận được (chờ bao lâu mới vào chơi). */
-    const _t0=performance.now();
     generate();
-    KC_GENMS=Math.round(performance.now()-_t0);
     if(pendingEdits){for(const [k,t] of pendingEdits){const [x,y,z]=k.split(',').map(Number);if(t)blocks.set(k,t);else blocks.delete(k);}pendingEdits=null;}
-    const _t1=performance.now();
     computeAllVisible();rebuildMeshes();
-    KC_MESHMS=Math.round(performance.now()-_t1);
     /* Bản đồ Làng bán kính 100 (đường chéo 141) nên mức Cao 230 là 'thấy hết',
    mức Thấp/Vừa mới thật sự cắt bớt để giữ FPS trên iPad và máy phòng tin học. */
     /* Số đo THẬT trên bản đồ Làng (đo bằng tools/tview.js, 108.099 khối thấy được):
@@ -4374,14 +4447,10 @@ function startWorld(){
          tầm 96 -> 665k                          rộng 200 nên cắt xa hơn không còn tác dụng)
        Mốc so sánh: bản đồ Sân trường ở mức Cao hiện là 607k. Vậy Thấp 88 còn NHẸ hơn
        sân trường hôm nay, Vừa 128 xấp xỉ gấp rưỡi, Cao 230 là thấy hết bản đồ. */
-    /* Số đo THẬT sau khi thêm cây thật (tools/tview.js, 159.592 khối thấy được):
-         tầm 64 -> 422k tam giác    tầm 120 -> 1.336k
-         tầm 80 -> 668k             tầm 150 -> 1.455k (bão hoà từ đây)
-         tầm 96 -> 931k             tầm 230 -> 1.461k
-       Mốc so sánh: bản đồ Sân trường ở mức Cao = 647k. Cây thật làm số khối thấy
-       được tăng 54% (103.706 -> 159.592), nên phải HẠ mốc Thấp và Vừa xuống, không
-       thì iPad tụt FPS: Thấp 76 (~600k, xấp xỉ sân trường hôm nay), Vừa 108 (~1,15M). */
-    kcSetView(KC_Q==='low'?76:(KC_Q==='mid'?108:(KC_Q==='high'?230:(KC_MOBILE?76:132))));
+    /* Hạ mức Thấp/Vừa xuống vì cây thật làm số tam giác tăng: mức Thấp phải nhẹ hơn
+         bản đồ Sân trường thì iPad phòng máy mới chạy nổi. Mức Cao giữ 230 (thấy hết
+         bản đồ) cho laptop. */
+      kcSetView(KC_Q==='low'?76:(KC_Q==='mid'?108:(KC_Q==='high'?230:(KC_MOBILE?76:132))));
     kcApplyMapPOI();
     setupShopVisuals();
     setupBoardVisual();
@@ -4764,10 +4833,22 @@ function primaryAction(){ // đánh / phá / bắn tại tâm ngắm
     if(!online){gainItem(wasOre,1);showBanner(IT_INFO[wasOre][0]+' Đào được '+IT_INFO[wasOre][1]+'!');}
   }else blip(300);
 }
+/* Ô xây dùng gần nhất. Nhờ nó, chuột phải vẫn đặt được khi tay đang cầm cuốc —
+   không phải đổi ô qua lại giữa mỗi lần đào và mỗi lần đặt. */
+let lastBlockIdx=3;
 function placeAction(){ // đặt khối tại tâm ngắm
-  if(!playing||npcOpen||shopOpen||testOpen||peOpen||dressOpen||dead||frozenT>0||driving||riding)return;
-  const sel=HOTBAR[selIdx];
-  if(sel>=100){showBanner('✋ Chọn ô 4–0 để đặt khối (ô 1 kiếm · 2 cung · 3 cuốc)');return;}
+  /* palOpen/craftOpen trước đây THIẾU ở đây (primaryAction thì có) — nên đang mở kho
+     khối mà bấm chuột phải vẫn đặt được khối sau lưng bảng. */
+  if(!playing||npcOpen||shopOpen||testOpen||peOpen||dressOpen||craftOpen||palOpen||dead||frozenT>0||driving||riding)return;
+  let sel=HOTBAR[selIdx];
+  if(sel>=100){
+    /* Đang cầm dụng cụ: KHÔNG chặn nữa. Lấy khối ở ô xây dùng gần nhất; nếu ô đó
+       cũng đã thành dụng cụ thì tìm ô xây đầu tiên còn lại. */
+    let bi=(HOTBAR[lastBlockIdx]<100)?lastBlockIdx:HOTBAR.findIndex(x=>x<100);
+    if(bi<0){showBanner('✋ Thanh đồ chưa có khối nào — nhấn G mở kho khối');return;}
+    sel=HOTBAR[bi];
+    lastBlockIdx=bi;
+  }else lastBlockIdx=selIdx;
   const hit=raycast();
   if(!hit)return;
   const nx=hit.x+hit.face[0],ny=hit.y+hit.face[1],nz=hit.z+hit.face[2];
@@ -4900,6 +4981,7 @@ function pickPaletteBlock(t){
     selIdx=i;
   }
   HOTBAR[i]=t;
+  lastBlockIdx=i;                 // chọn khối trong kho = từ nay chuột phải đặt khối này
   try{localStorage.setItem('kc_hotbar',JSON.stringify(HOTBAR));}catch(e){}
   buildHotbar();updateHandItem();
   showBanner('🧱 Ô '+((i+1)%10)+': '+(NAMES[t]||'khối'));
@@ -4936,9 +5018,27 @@ try{
   const sv=JSON.parse(localStorage.getItem('kc_hotbar')||'null');
   if(Array.isArray(sv)&&sv.length===HOTBAR.length){
     sv.forEach((t,i)=>{if(typeof t==='number'&&(t>=SWORD||MATS[t]))HOTBAR[i]=t;});
-    buildHotbar();
   }
 }catch(e){}
+/* 🛠️ CỨU THANH ĐỒ: bảo đảm ô 1–3 luôn là kiếm / cung / cuốc.
+   Bản cũ của game có thể đã lưu một thanh đồ mà ô 3 (CUỐC) bị ghi đè bằng khối —
+   localStorage giữ mãi, và người chơi thì KHÔNG BAO GIỜ đào được nữa, cũng không có
+   cách nào lấy cuốc lại trong game. Đây là lý do thật của phàn nàn "không đào/đặt
+   được". Ba ô này từ nay không thể mất. */
+(function(){
+  const need=[SWORD,BOW,PICK];
+  let fixed=false;
+  need.forEach((tool,i)=>{ if(HOTBAR[i]!==tool){HOTBAR[i]=tool;fixed=true;} });
+  /* ô 4–0 phải có ít nhất MỘT khối, nếu không thì không đặt được gì */
+  if(!HOTBAR.some((t,i)=>i>=3&&t<100)){HOTBAR[3]=T.GRASS;fixed=true;}
+  if(fixed){
+    try{localStorage.setItem('kc_hotbar',JSON.stringify(HOTBAR));}catch(e){}
+    console.log('[KhốiCraft] đã sửa lại thanh đồ: ô 1-3 = kiếm/cung/cuốc');
+  }
+  lastBlockIdx=HOTBAR.findIndex((t,i)=>i>=3&&t<100);
+  if(lastBlockIdx<0)lastBlockIdx=3;
+  buildHotbar();
+})();
 
 /* ===== 🖼️ gắn ảnh giao diện của pack vào CSS ===== */
 (function(){
@@ -4984,7 +5084,7 @@ function enterGame(){
   $('hotbar').style.display='flex';
   $('topright').style.display='block';
   $('hint').style.display='block';
-  $('hint').innerHTML='1 Kiếm · 2 Cung · 3 Cuốc (đào) · 4–0 Khối · R: đi nhanh ×2 · B: tủ đồ · X: chế tạo · G: kho khối · L: bảng vàng · T: chat · F: bay · C: góc nhìn · E: ăn';
+  $('hint').innerHTML='⛏️ Cầm <b>CUỐC (phím 3)</b>: chuột <b>trái đào</b> · chuột <b>phải đặt khối</b> — không cần đổi ô! · G: kho khối · 4–0: chọn khối · R: chạy · B: tủ đồ · X: chế tạo · L: bảng vàng · T: chat · F: bay · E: ăn';
   // 🔄 sau khi hết ván tự vào lại với tên cũ
   try{
     const n=sessionStorage.getItem('kc_name');
@@ -5137,7 +5237,7 @@ function animate(){
 }
 animate();
 setStatus('Nhập tên rồi bấm "Vào thế giới" nhé!');
-window._dbg={blocks,visible,others,mobs,drops,inv,setBlockLocal,get trees(){return KC_TREES;},get genms(){return [KC_GENMS,KC_MESHMS];},sendNet:send,soloAttack,soloSpawnZombie,soloSpawnAnimal,soloSpawnCreeper,spawnNPC,openQuestion,gainItem,boomLocal,topAt,
+window._dbg={blocks,visible,others,mobs,drops,inv,setBlockLocal,raycast,selectSlot,openPalette,pickPaletteBlock,get selIdx(){return selIdx;},HOTBAR,sendNet:send,soloAttack,soloSpawnZombie,soloSpawnAnimal,soloSpawnCreeper,spawnNPC,openQuestion,gainItem,boomLocal,topAt,
   get online(){return online;},get myId(){return myId;},get hp(){return myHP;},get npcPos(){return npc.group?[npc.x,npc.y,npc.z]:null;},P,joy,primaryAction,placeAction,
   SHOPS,upgrades,openShop,closeShop,launchFirework,get shopOpen(){return shopOpen;},
   startTest,freezePlayer,teacher,guard,reportVandalism,toggleCam,spawnChaser,escalateChaser,
