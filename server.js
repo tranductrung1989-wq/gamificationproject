@@ -16,6 +16,7 @@ const VGY = 63;                 // cao độ nền bản đồ Làng — ⚠️ 
 const MAPSPEC = {
   campus:  { R: 80,  H: 128, spawnY: 96 },
   village: { R: 100, H: 212, spawnY: 78 },
+  fantasy: { R: 115, H: 212, spawnY: 78 },
 };
 // Khu vực đặc biệt (GIỐNG HỆT client!)
 const CAMPUS = {x0:-24, x1:24, z0:8, z1:46, H:60};   // 12 + GROUND_LIFT
@@ -90,11 +91,11 @@ function newWorld(id) {
     matchStart: Date.now(), matchOver: false,
     animalT: 8, zombieT: 3, creeperT: 15, fishT: 6 };
 }
-const WORLDS = { campus: newWorld('campus'), village: newWorld('village') };
+const WORLDS = { campus: newWorld('campus'), village: newWorld('village'), fantasy: newWorld('fantasy') };
 let W = WORLDS.campus;
 function useWorld(id) {
   W = WORLDS[id] || WORLDS.campus;
-  WORLD_R = W.R; WORLD_H = W.H; IS_V = (W.id === 'village');
+  WORLD_R = W.R; WORLD_H = W.H; IS_V = (W.id !== 'campus');
 }
 /* Người chơi TRONG thế giới đang xử lý. Trả về MẢNG chứ không phải generator, vì
    nhiều chỗ vừa lặp vừa xoá phần tử. */
@@ -183,15 +184,19 @@ function padDist(x, z) {
 }
 const VLAKE = { x: 78, z: 0, r: 16, depth: 6 };
 const VTRACK = { x0: 22, x1: 62, z0: 46, z1: 86, H: 63, cx: 42, cz: 66, rx: 17, rz: 16 };
+// Bản đồ Thị trấn kỳ ảo — ⚠️ GIỐNG HỆT MAPS.fantasy phía client
+const FLAKE = { x: 90, z: 18, r: 18, depth: 6 };
+const FTRACK = { x0: 44, x1: 80, z0: 66, z1: 102, H: 63, cx: 62, cz: 84, rx: 17, rz: 16 };
 function heightAtVillage(x, z) {
+  const NF = (W.id === 'fantasy') ? 700 : 300;   // ⚠️ = MAP.noff phía client
   let a = 0, amp = 1, f = 0.021, tot = 0;
-  for (let o = 0; o < 4; o++) { a += vnoise(x * f + 300, z * f + 300) * amp; tot += amp; amp *= 0.5; f *= 2.1; }
+  for (let o = 0; o < 4; o++) { a += vnoise(x * f + NF, z * f + NF) * amp; tot += amp; amp *= 0.5; f *= 2.1; }
   let h = Math.floor(VGY - 5 + (a / tot) * 12);
-  const L = VLAKE;
+  const L = (W.id === 'fantasy') ? FLAKE : VLAKE;
   const ldx = x - L.x, ldz = z - L.z, dl = Math.sqrt(ldx * ldx + ldz * ldz);
   if (dl < L.r) { const t = 1 - dl / L.r; h = SEA - 1 - Math.floor(L.depth * t); }
   else if (dl < L.r + 7) { const t = (dl - L.r) / 7; h = Math.round((SEA + 1) * (1 - t) + h * t); }
-  const K2 = VTRACK;
+  const K2 = (W.id === 'fantasy') ? FTRACK : VTRACK;
   if (x >= K2.x0 - 4 && x <= K2.x1 + 4 && z >= K2.z0 - 4 && z <= K2.z1 + 4) {
     const dx = Math.max(0, Math.max(K2.x0 - x, x - K2.x1));
     const dz = Math.max(0, Math.max(K2.z0 - z, z - K2.z1));
@@ -950,12 +955,30 @@ function loadVillage() {
       const a = d.b[t], tt = t | 0;
       for (let i = 0; i < a.length; i += 3) { w.structure.set(a[i] + ',' + a[i + 1] + ',' + a[i + 2], tt); n++; }
     }
-    console.log('🏘️  Làng Khởi Đầu: ' + n + ' khối, ' + w.pads.length + ' vùng san nền');
+    console.log('🏘️  Làng tân thủ: ' + n + ' khối, ' + w.pads.length + ' vùng san nền');
   } catch (e) {
     console.log('⚠️  Không đọc được public/maps/village.json (' + e.code + ') — bản đồ Làng vẫn chơi được, nhưng quái vật sẽ đi xuyên nhà.');
   }
 }
 loadVillage();
+/* Thị trấn kỳ ảo: cùng cơ chế với Làng — server và client đọc CÙNG một file. */
+function loadFantasy() {
+  const f = path.join(__dirname, 'public', 'maps', 'fantasy.json');
+  try {
+    const d = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const w = WORLDS.fantasy;
+    w.pads = d.pads || [];
+    let n = 0;
+    for (const t in d.b) {
+      const a = d.b[t], tt = t | 0;
+      for (let i = 0; i < a.length; i += 3) { w.structure.set(a[i] + ',' + a[i + 1] + ',' + a[i + 2], tt); n++; }
+    }
+    console.log('🏰 Thị trấn kỳ ảo: ' + n + ' khối, ' + w.pads.length + ' vùng san nền');
+  } catch (e) {
+    console.log('⚠️  Không đọc được public/maps/fantasy.json (' + e.code + ') — bản đồ Kỳ Ảo vẫn chơi được, nhưng quái vật sẽ đi xuyên nhà.');
+  }
+}
+loadFantasy();
 for (const id in WORLDS) { useWorld(id); spawnStones(); for (let i = 0; i < 22; i++) spawnAnimal(); for (let i = 0; i < 14; i++) spawnFish(); }
 useWorld('campus');
 server.listen(PORT, () => {
