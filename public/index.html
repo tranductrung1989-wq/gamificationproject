@@ -384,7 +384,7 @@
 const VGY = 63;              // cao độ nền phẳng của bản đồ Làng (build đứng ở y=64)
 const MAPS = {
   campus: {
-    id:'campus', name:'Sân trường BUV', R:80, H:128,
+    id:'campus', name:'Sân trường', R:80, H:128,
     desc:'Bản đồ gốc: trường học, hồ nước, đảo hoang, đường đua 4WD, rừng rậm.',
     icon:'🏫',
     poi:{ spawn:[0,0,18],
@@ -392,9 +392,9 @@ const MAPS = {
           board:[-6,60.55,15.6], pe:[70.5,9.5] }
   },
   village: {
-    id:'village', name:'Làng Khởi Đầu', R:100, H:212,
+    id:'village', name:'Làng tân thủ', R:100, H:212,
     desc:'Cả một ngôi làng trên đảo, cây Noel 146 tầng, tháp xương rồng, đền hoa.',
-    icon:'🏘️', data:'maps/village.json',
+    icon:'🏘️', data:'maps/village.json', noff:300,
     /* Quảng trường chợ 22×18 ở giữa làng. Chọn bằng cách quét mọi hình chữ nhật
        trong làng và cho điểm: KHÔNG có ô nước (lần đầu đặt ở tây bắc thì nó cắt
        ngang con sông, hiện ra một mảng cỏ vuông đè lên mặt nước), không có ô
@@ -411,6 +411,17 @@ const MAPS = {
     poi:{ spawn:[-25,0,4],
           shops:[[-31.5,11.2,-31.5,8],[-24.5,11.2,-24.5,8],[-17.5,11.2,-17.5,8]],
           board:[-24,64.55,-1.4], pe:[42.5,50.5] }
+  },
+  fantasy: {
+    id:'fantasy', name:'Thị trấn kỳ ảo', R:115, H:212,
+    desc:'Khu trưng bày GraySun: nhà thờ, thành băng, đền thạch anh, bến cảng bên vịnh, cây Vân sam 133 tầng.',
+    icon:'🏰', data:'maps/fantasy.json', noff:700,
+    plaza:{x0:-11,x1:12,z0:-9,z1:10},
+    track:{x0:44,x1:80,z0:66,z1:102,H:63,cx:62,cz:84,rx:17,rz:16},
+    lake:{x:90,z:18,r:18,depth:6},
+    poi:{ spawn:[0,0,-2],
+          shops:[[-6.5,5.2,-6.5,2],[0.5,5.2,0.5,2],[7.5,5.2,7.5,2]],
+          board:[1,64.55,-7.4], pe:[62.5,84.5] }
   }
 };
 function kcPickMap(){
@@ -424,7 +435,7 @@ function kcPickMap(){
 }
 let MAP_ID = kcPickMap();
 let MAP = MAPS[MAP_ID];
-let IS_V = MAP_ID === 'village';       // cờ số học, dùng trong heightAt (đường nóng)
+let IS_V = MAP_ID !== 'campus';       // cờ số học, dùng trong heightAt (đường nóng)
 let WORLD_R = MAP.R;
 let WORLD_H = MAP.H;
 let KC_DEEP = IS_V ? 6 : 10;   // gán vào DEEP_KEEP ngay dưới phần khai báo nó
@@ -486,6 +497,11 @@ Object.assign(NAMES, {
 for(let i=25;i<=48;i++) CAPS[i]=2500;
 /* làng dùng nhiều: kính đỏ 2.949, đá phát sáng 1.831, bê tông đỏ/trắng ~1.500 */
 CAPS[45]=5000; CAPS[44]=4000; CAPS[38]=4000; CAPS[33]=3500; CAPS[31]=3500; CAPS[37]=3500; CAPS[34]=3500;
+/* Bản đồ Kỳ Ảo (154,8 nghìn khối build, R 115): nới các loại tprobe báo tràn/sát trần.
+   Vượt CAPS là khối lặng lẽ biến mất — luôn chạy tprobe (capFull phải rỗng) sau khi đổi. */
+CAPS[8]=34000; CAPS[37]=9000; CAPS[34]=8000; CAPS[46]=6000; CAPS[36]=4500;
+CAPS[41]=4500; CAPS[24]=5000; CAPS[43]=3500; CAPS[30]=3500; CAPS[17]=13000; CAPS[18]=7000;
+CAPS[1]=64000; CAPS[2]=44000; CAPS[3]=52000;
 Object.assign(TRANSPARENT, {40:true, 44:true, 45:true});
 /* danh sách hiện trong bảng chọn khối — thứ tự này là thứ tự hiển thị */
 const PALETTE = [
@@ -980,13 +996,13 @@ function padDist(x,z){
 }
 function heightAtVillage(x,z){
   let a=0,amp=1,f=0.021,tot=0;
-  for(let o=0;o<4;o++){a+=vnoise(x*f+300,z*f+300)*amp;tot+=amp;amp*=0.5;f*=2.1;}
+  for(let o=0;o<4;o++){a+=vnoise(x*f+MAP.noff,z*f+MAP.noff)*amp;tot+=amp;amp*=0.5;f*=2.1;}
   let h=Math.floor(VGY-5+(a/tot)*12);       // 58..70: có chỗ trũng thành vũng nước
-  const L=MAPS.village.lake;
+  const L=MAP.lake;
   const ldx=x-L.x,ldz=z-L.z,dl=Math.sqrt(ldx*ldx+ldz*ldz);
   if(dl<L.r){const t=1-dl/L.r;h=SEA-1-Math.floor(L.depth*t);}
   else if(dl<L.r+7){const t=(dl-L.r)/7;h=Math.round((SEA+1)*(1-t)+h*t);}
-  const K2=MAPS.village.track;              // đường đua: san phẳng như sân trường
+  const K2=MAP.track;              // đường đua: san phẳng như sân trường
   if(x>=K2.x0-4&&x<=K2.x1+4&&z>=K2.z0-4&&z<=K2.z1+4){
     const dx=Math.max(0,Math.max(K2.x0-x,x-K2.x1));
     const dz=Math.max(0,Math.max(K2.z0-z,z-K2.z1));
@@ -1023,9 +1039,9 @@ function heightAtCampus(x,z){
   return h;
 }
 function inCampus(x,z,m){if(IS_V)return false;return x>=CAMPUS.x0-m&&x<=CAMPUS.x1+m&&z>=CAMPUS.z0-m&&z<=CAMPUS.z1+m;}
-function inTrack(x,z,m){const K2=IS_V?MAPS.village.track:TRACK;
+function inTrack(x,z,m){const K2=IS_V?MAP.track:TRACK;
   return x>=K2.x0-m&&x<=K2.x1+m&&z>=K2.z0-m&&z<=K2.z1+m;}
-function inLake(x,z,m){const L=IS_V?MAPS.village.lake:LAKE;
+function inLake(x,z,m){const L=IS_V?MAP.lake:LAKE;
   const dx=x-L.x,dz=z-L.z;return Math.sqrt(dx*dx+dz*dz)<L.r+m;}
 
 /* ═══════════ 🕳️ HANG ĐỘNG + TẦNG SÂU — ⚠️ GIỐNG HỆT server! ═══════════
@@ -1218,7 +1234,7 @@ function genVillage(){
      Phá cây và ruộng để có chỗ dựng quầy hàng, NHƯNG giữ nước: nếu quét sạch rồi
      lấp cỏ toàn bộ thì mặt hồ/sông trong vùng biến thành một mảng cỏ vuông vức,
      nhìn rất giả (đã bị đúng lỗi này ở lần đặt quảng trường đầu tiên). */
-  const P2=MAPS.village.plaza;
+  const P2=MAP.plaza;
   for(let x=P2.x0-1;x<=P2.x1+1;x++)for(let z=P2.z0-1;z<=P2.z1+1;z++){
     const g=blocks.get(K(x,VGY+1,z));
     if(g===T.WATER) continue;                // ô nước: để yên
@@ -1230,7 +1246,7 @@ function genVillage(){
 }
 /* đường đua ngoài đảo — dùng lại đúng cách vẽ của sân trường, chỉ đổi toạ độ */
 function buildVTrack(){
-  const K2=MAPS.village.track;
+  const K2=MAP.track;
   for(let x=K2.x0;x<=K2.x1;x++)for(let z=K2.z0;z<=K2.z1;z++){
     const dx=(x-K2.cx)/K2.rx,dz=(z-K2.cz)/K2.rz;
     const r=Math.sqrt(dx*dx+dz*dz);
@@ -1580,7 +1596,7 @@ let TRACK_PTS=[[72,15,0],[70,24,5],[64,27,13],[54,21,1],[44,27,7],[37,24,2],[35,
    chỉ đổi vị trí — an toàn hơn nhiều so với vẽ lại một đường ray mới. */
 function kcApplyMapTrack(){
   if(!IS_V) return;
-  const V=MAPS.village.track;
+  const V=MAP.track;
   const dx=V.cx-54, dz=V.cz-15;
   TRACK_PTS=TRACK_PTS.map(p=>[p[0]+dx,p[1]+dz,p[2]]);
   TRACK=V;
@@ -4424,7 +4440,7 @@ function kcLoadMapData(cb){
     /* Hay gặp nhất: mở index.html bằng file:// -> trình duyệt chặn fetch.
        Nói thẳng cách sửa thay vì treo màn hình chờ. */
     setStatus('❌ Không tải được bản đồ ' + MAP.name + ' (' + e.message + ').');
-    showBanner('⚠️ Không tải được '+MAP.name+' — về Sân trường BUV');
+    showBanner('⚠️ Không tải được '+MAP.name+' — về Sân trường');
     MAP_ID='campus';MAP=MAPS.campus;IS_V=false;
     WORLD_R=MAP.R;WORLD_H=MAP.H;MAPDATA=null;VPADS=[];hCache.clear();
     kcApplyMapPOI();
@@ -4503,7 +4519,7 @@ function connect(){
       /* Máy chủ có thể ĐỔI bản đồ của mình (ví dụ bản đồ mình chọn chưa được bật).
          Nếu vậy phải theo máy chủ, nếu không hai bên ở hai thế giới khác nhau. */
       if(m.map&&m.map!==MAP_ID&&MAPS[m.map]){
-        MAP_ID=m.map;MAP=MAPS[m.map];IS_V=(m.map==='village');
+        MAP_ID=m.map;MAP=MAPS[m.map];IS_V=(m.map!=='campus');
         WORLD_R=MAP.R;WORLD_H=MAP.H;hCache.clear();
         showBanner('🗺️ Máy chủ chuyển bạn sang '+MAP.name);
       }
